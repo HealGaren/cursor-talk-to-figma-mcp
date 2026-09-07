@@ -1202,7 +1202,9 @@
             // Send error back to WebSocket
             sendErrorResponse(
               data.id,
-              error.message || "Error executing command"
+              // Same reason as the plugin side: a thrown value without a
+              // message was replaced by a sentence that says nothing.
+              (error && error.message) || (typeof error === "string" ? error : String(error)) || "Error executing command"
             );
           }
         }

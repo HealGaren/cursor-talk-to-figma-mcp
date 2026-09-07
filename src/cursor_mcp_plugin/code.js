@@ -81,6 +81,25 @@ figma.showUI(__html__, UI_COMPACT_SIZE);
 })();
 
 // Plugin commands from UI
+// What actually went wrong, whatever shape it was thrown in.
+//
+// `error.message || "Error executing command"` silently replaced the real cause
+// whenever the thrown value was not an Error with a message — a plain string, a
+// rejected Figma API call, an object. set_current_page has been failing on
+// GW_Apple Watch and the only trace anywhere, including the relay's error
+// ledger, was the fixed sentence, which says nothing at all.
+function describeCommandError(error) {
+  if (error === null || error === undefined) return "Error executing command (no detail thrown)";
+  if (typeof error === "string") return error;
+  if (error.message) return String(error.message);
+  if (error.name) return String(error.name);
+  try {
+    const asJson = JSON.stringify(error);
+    if (asJson && asJson !== "{}") return asJson.slice(0, 300);
+  } catch (e) {}
+  return String(error);
+}
+
 figma.ui.onmessage = async (msg) => {
   switch (msg.type) {
     case "update-settings":
@@ -119,7 +138,7 @@ figma.ui.onmessage = async (msg) => {
         figma.ui.postMessage({
           type: "command-error",
           id: msg.id,
-          error: error.message || "Error executing command",
+          error: describeCommandError(error),
           docMeta: getDocMeta(),
         });
       }
