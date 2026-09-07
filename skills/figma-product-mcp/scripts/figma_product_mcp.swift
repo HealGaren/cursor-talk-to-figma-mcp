@@ -893,12 +893,21 @@ func scriptProbe(baseURL: String, project: Project, timeout: TimeInterval = 8) -
 func runDoctor(app: NSRunningApplication, root: AXUIElement, config: Config, options: Options) {
     let axWindows = windows(root)
     let webAreas = axWindows.filter { window in descendants(window).contains { role($0) == "AXWebArea" } }
-    let listOptions: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-    let rows = (CGWindowListCopyWindowInfo(listOptions, kCGNullWindowID) as? [[String: Any]]) ?? []
-    let serverNames = rows.filter {
-        ($0[kCGWindowOwnerName as String] as? String) == "Figma"
-            && ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 0
-    }.compactMap { $0[kCGWindowName as String] as? String }
+    // An empty name list has two very different causes and the fix differs:
+    // Screen Recording not granted (rows exist, every name is nil) versus the
+    // windows not being on screen at all (no rows to begin with, e.g. another
+    // Space or a locked screen). Report both counts, and count the off-screen
+    // list too so the two can never be confused again.
+    func figmaRows(_ listOptions: CGWindowListOption) -> [[String: Any]] {
+        ((CGWindowListCopyWindowInfo(listOptions, kCGNullWindowID) as? [[String: Any]]) ?? []).filter {
+            ($0[kCGWindowOwnerName as String] as? String) == "Figma"
+                && ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 0
+        }
+    }
+    let rows = figmaRows([.optionOnScreenOnly, .excludeDesktopElements])
+    let allRows = figmaRows([.optionAll, .excludeDesktopElements])
+    let serverNames = rows.compactMap { $0[kCGWindowName as String] as? String }
+    let allNames = allRows.compactMap { $0[kCGWindowName as String] as? String }
 
     let snapshot = fetchRelaySnapshot(baseURL: options.relayURL)
     var projects: [[String: Any]] = []
@@ -930,6 +939,9 @@ func runDoctor(app: NSRunningApplication, root: AXUIElement, config: Config, opt
         // The window server: the fallback that identifies windows without AX.
         // Empty names mean Screen Recording is not granted to this process.
         "windowServerNames": serverNames,
+        "windowServerOnScreenRows": rows.count,
+        "windowServerAllRows": allRows.count,
+        "windowServerAllNames": allNames,
         "relayReachable": snapshot != nil,
         "projects": projects,
     ]
