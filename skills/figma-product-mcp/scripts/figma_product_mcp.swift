@@ -66,6 +66,7 @@ struct Options {
     var promptAccessibility = false
     var allProjects = false
     var forceReconnect = false
+    var doctor = false
     var timeout: TimeInterval = 25
     var relayURL = ProcessInfo.processInfo.environment["TALK_TO_FIGMA_RELAY_URL"] ?? "http://127.0.0.1:3055"
     var selectedIDs = Set<String>()
@@ -95,6 +96,7 @@ func parseOptions() throws -> Options {
         case "--open-only": options.openOnly = true
         case "--all": options.allProjects = true
         case "--force-reconnect": options.forceReconnect = true
+        case "--doctor": options.doctor = true
         case "--prompt-accessibility": options.promptAccessibility = true
         case "--help", "-h":
             print("""
@@ -840,6 +842,102 @@ func acquireRunLock(waitFor timeout: TimeInterval) -> RunLock {
     return .busy
 }
 
+// ---------------------------------------------------------------------------
+// --doctor: read-only diagnosis of the two things a run depends on.
+//
+// A run that reports "forced re-run skipped, no renderer accessibility tree"
+// says what failed but not why, and the fix differs completely depending on
+// which layer is down: the renderer tree, the native menu bar, the window
+// server, or the plugin channel itself. Those are four independent signals and
+// only the first one is currently reported, so a blocked run leaves nothing to
+// act on.
+//
+// This touches nothing — no window is raised, no menu opened, no plugin re-run
+// — so it is safe to run against seven live channels that other people are
+// using. The menu bar is read deliberately: it hangs off the application
+// element, NOT off the renderer, so a reachable menu bar with an unreachable
+// renderer tree means the plugin menu could still be driven and only window
+// identification is lost.
+func scriptProbe(baseURL: String, project: Project, timeout: TimeInterval = 8) -> [String: Any] {
+    var components = URLComponents(string: baseURL.hasSuffix("/") ? baseURL + "script/run" : baseURL + "/script/run")
+    components?.queryItems = [URLQueryItem(name: "project", value: project.displayTitle)]
+    guard let url = components?.url else { return ["reached": false, "detail": "bad relay URL"] }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.timeoutInterval = timeout
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: ["code": "return figma.root.name"])
+    var payload: Data?
+    let started = Date()
+    let semaphore = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: request) { data, _, _ in
+        payload = data
+        semaphore.signal()
+    }.resume()
+    let answered = semaphore.wait(timeout: .now() + timeout + 1) == .success
+    let ms = Int(Date().timeIntervalSince(started) * 1000)
+    guard answered,
+          let data = payload,
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return ["reached": false, "ms": ms, "detail": "relay did not answer"] }
+    if root["ok"] as? Bool == true, let encoded = root["result"] as? String {
+        let name = (try? JSONSerialization.jsonObject(with: Data(encoded.utf8), options: [.fragmentsAllowed])) as? String
+        return ["reached": true, "answered": true, "ms": ms, "document": name ?? encoded]
+    }
+    // The plugin answered and the answer was an error. That is proof the tab
+    // cannot serve commands, which "no reply" never is.
+    let detail = (root["error"] as? String) ?? String(describing: root)
+    return ["reached": true, "answered": false, "ms": ms, "error": detail]
+}
+
+func runDoctor(app: NSRunningApplication, root: AXUIElement, config: Config, options: Options) {
+    let axWindows = windows(root)
+    let webAreas = axWindows.filter { window in descendants(window).contains { role($0) == "AXWebArea" } }
+    let listOptions: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    let rows = (CGWindowListCopyWindowInfo(listOptions, kCGNullWindowID) as? [[String: Any]]) ?? []
+    let serverNames = rows.filter {
+        ($0[kCGWindowOwnerName as String] as? String) == "Figma"
+            && ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 0
+    }.compactMap { $0[kCGWindowName as String] as? String }
+
+    let snapshot = fetchRelaySnapshot(baseURL: options.relayURL)
+    var projects: [[String: Any]] = []
+    for project in config.projects {
+        var row: [String: Any] = ["id": project.id, "title": project.title]
+        switch pluginState(snapshot, project: project, window: nil) {
+        case .missing: row["relay"] = "missing"
+        case .stale(let version): row["relay"] = "stale \(version ?? "?")"
+        case .current(let version, let channelName):
+            row["relay"] = "current \(version ?? "?")"
+            row["channel"] = channelName ?? ""
+        }
+        row["probe"] = scriptProbe(baseURL: options.relayURL, project: project)
+        row["windowFound"] = projectWindow(root, project: project) != nil
+        projects.append(row)
+    }
+
+    let report: [String: Any] = [
+        "doctor": true,
+        "figmaPID": app.processIdentifier,
+        "accessibilityTrusted": AXIsProcessTrusted(),
+        // The renderer tree: needed to match a window to a file via AX.
+        "rendererAccessibilityReady": !webAreas.isEmpty,
+        "axWindowCount": axWindows.count,
+        "axWindowsWithWebArea": webAreas.count,
+        // The native menu bar: independent of the renderer, and the only path
+        // to Plugins > Development.
+        "menuBarTitles": menuBarTitles(root),
+        // The window server: the fallback that identifies windows without AX.
+        // Empty names mean Screen Recording is not granted to this process.
+        "windowServerNames": serverNames,
+        "relayReachable": snapshot != nil,
+        "projects": projects,
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]),
+          let text = String(data: data, encoding: .utf8) else { return }
+    print(text)
+}
+
 func emitReport(_ report: Report) {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -932,6 +1030,14 @@ do {
     }
     let app = try launchFigmaIfNeeded(timeout: options.timeout)
     let root = appAX(app)
+
+    // --doctor reports and stops. It must run BEFORE enableRendererAccessibility
+    // so it observes the tree as a normal run finds it, and it deliberately does
+    // not write the report file: a diagnosis is not a run outcome.
+    if options.doctor {
+        runDoctor(app: app, root: root, config: config, options: options)
+        exit(0)
+    }
 
     // Renderer accessibility has to be up BEFORE anything reads the tree.
     //
