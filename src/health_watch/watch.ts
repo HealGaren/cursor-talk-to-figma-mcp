@@ -512,22 +512,44 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
       return false;
     };
 
+    // Opening another page is itself expensive, and failing to is not an outage.
+    //
+    // get_document_info with a pageId loads that page, and on a heavy one the
+    // plugin does not answer inside Figma's own 10s window: it throws "Unable
+    // to establish connection to Figma after 10 seconds." Letting that escape
+    // turned a probe whose pages/select/restore/read had all just passed into
+    // a hard failure — the plugin was plainly alive, one page was merely too
+    // big to open on demand. A page that will not open is a page to skip.
+    const unopened: string[] = [];
     let done = await tryPage(info?.name || "현재 페이지", info);
     if (!done && !ranOutOfTime) {
       for (const page of list.filter((entry: any) => entry?.id && entry.id !== currentId).slice(0, EXPORT_PAGES)) {
         if (ranOutOfTime || Date.now() >= exportDeadline) { ranOutOfTime = true; break; }
-        const elsewhere: any = await timed("read2", () =>
-          runCommand(channel, "get_document_info", { pageId: page.id }, DEEP_COMMAND_MS));
-        done = await tryPage(page.name || page.id, elsewhere);
+        const pageLabel = page.name || page.id;
+        const readStarted = Date.now();
+        let elsewhere: any;
+        try {
+          elsewhere = await timed("read2", () =>
+            runCommand(channel, "get_document_info", { pageId: page.id },
+              Math.min(DEEP_COMMAND_MS, Math.max(1, exportDeadline - Date.now()))));
+        } catch (error) {
+          timings.push(`read2(실패) ${Date.now() - readStarted}ms`);
+          unopened.push(`${pageLabel}: ${error instanceof Error ? error.message : String(error)}`);
+          continue;
+        }
+        done = await tryPage(pageLabel, elsewhere);
         if (done) break;
       }
     }
 
     if (!seen) {
       return { project: name, ok: true, ms: Date.now() - probeStarted,
-        detail: `${loadNote} · ${list.length} pages, selection ok, 내용 있는 페이지 없음 · ${timings.join(" · ")}` };
+        detail: `${loadNote} · ${list.length} pages, selection ok, 내용 있는 페이지 없음`
+          + `${unopened.length ? ` (열리지 않은 페이지 ${unopened.length}개: ${unopened.join(" · ")})` : ""}`
+          + ` · ${timings.join(" · ")}` };
     }
-    const scope = `${pagesLooked}개 페이지에서 ${tried}/${seen}개 시도`;
+    const skippedPages = unopened.length ? `, 열리지 않은 페이지 ${unopened.length}개` : "";
+    const scope = `${pagesLooked}개 페이지에서 ${tried}/${seen}개 시도${skippedPages}`;
     if (!bytes) {
       const allRefused = !ranOutOfTime && refusals.length > 0
         && refusals.every((entry) => entry.refused);
