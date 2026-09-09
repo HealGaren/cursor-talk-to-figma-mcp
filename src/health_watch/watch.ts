@@ -486,6 +486,14 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
     // and the deep probe always measures twice — 360s against a 300s cycle.
     // These candidates are 5458x2423 sections; exporting four of them in one
     // go timed out and dropped the plugin while this bug was being traced.
+    // Four was too few to actually test anything.
+    //
+    // GW_Product's 레퍼런스 page holds 45 top-level nodes and the first four
+    // all refuse, so the probe stopped there and never exported anything on
+    // the one file this export path exists to cover. A refusal costs ~30ms
+    // measured, not the seconds assumed when the cap was set, so looking
+    // further is nearly free and the shared budget below still bounds it.
+    const EXPORT_CANDIDATES = 12;
     const EXPORT_BUDGET_MS = DEEP_COMMAND_MS * 2;
     const exportDeadline = Date.now() + EXPORT_BUDGET_MS;
     // The reason is known where the failure happens. Recovering it later by
@@ -496,7 +504,7 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
     let usedTarget: any = null;
     let tried = 0;
     let ranOutOfTime = false;
-    for (const candidate of candidates.slice(0, 4)) {
+    for (const candidate of candidates.slice(0, EXPORT_CANDIDATES)) {
       const left = exportDeadline - Date.now();
       if (left <= 0) { ranOutOfTime = true; break; }
       tried++;
