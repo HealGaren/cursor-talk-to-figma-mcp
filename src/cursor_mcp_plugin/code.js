@@ -2137,8 +2137,15 @@ async function getMotion(nodeId, maxDepthParam, includeAnimationStyleSchemas) {
     : plain(rawStyles);
 
   return {
-    // `animations` missing entirely on the root means this Figma build predates Motion.
-    supported: safe(() => root.animations) !== undefined,
+    // Whether this Figma build has Motion at all, which is a property of the
+    // build and not of the node you happened to ask about. Deriving it from
+    // `root.animations` read false for any PAGE — pages have no `animations`
+    // key — so pointing this command at a page reported "your Figma predates
+    // Motion" on a build that supports it fine.
+    supported: safe(() => figma.motion) !== undefined,
+    // Whether the node you asked about can itself hold keyframes. PAGE cannot;
+    // frames and shapes can.
+    rootAnimatable: safe(() => root.animations) !== undefined,
     // The timeline the root sits on (id + duration in seconds). Inherited, so
     // it describes the containing frame, not the root itself.
     timeline: plain(safe(() => root.timelines)),
