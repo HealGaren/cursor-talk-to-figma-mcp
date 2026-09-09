@@ -1804,7 +1804,7 @@ async function getNodesInfo(nodeIds, fields, maxDepth, includeHash) {
 
     return responses;
   } catch (error) {
-    throw new Error(`Error getting nodes info: ${error.message}`);
+    throw new Error(`Error getting nodes info: ${describeCommandError(error)}`);
   }
 }
 
@@ -2551,7 +2551,7 @@ async function getReactions(nodeIds, maxDepthParam) {
           processedCount / totalCount,
           totalCount,
           processedCount,
-          `Error processing node: ${error.message}`
+          `Error processing node: ${describeCommandError(error)}`
         );
       }
     }
@@ -2573,7 +2573,7 @@ async function getReactions(nodeIds, maxDepthParam) {
       nodes: allResults
     };
   } catch (error) {
-    throw new Error(`Failed to get reactions: ${error.message}`);
+    throw new Error(`Failed to get reactions: ${describeCommandError(error)}`);
   }
 }
 
@@ -2602,7 +2602,7 @@ async function readMyDesign() {
 
     return responses;
   } catch (error) {
-    throw new Error(`Error getting nodes info: ${error.message}`);
+    throw new Error(`Error getting nodes info: ${describeCommandError(error)}`);
   }
 }
 
@@ -3466,7 +3466,7 @@ async function createComponentInstance(params) {
       mainComponentId: mainComponent ? mainComponent.id : undefined,
     };
   } catch (error) {
-    throw new Error(`Error creating component instance: ${error.message}`);
+    throw new Error(`Error creating component instance: ${describeCommandError(error)}`);
   }
 }
 
@@ -3671,7 +3671,7 @@ async function exportNodeAsImage(params) {
     }
     return out;
   } catch (error) {
-    throw new Error(`Error exporting node as image: ${error.message}`);
+    throw new Error(`Error exporting node as image: ${describeCommandError(error)}`);
   }
 }
 
@@ -3743,7 +3743,7 @@ function scheduleLivePreview(delay) {
       const result = await getCurrentFigmaScreenshot({ maxDimension: 1200 });
       figma.ui.postMessage({ type: "preview-frame", result });
     } catch (error) {
-      figma.ui.postMessage({ type: "preview-error", error: error.message || String(error) });
+      figma.ui.postMessage({ type: "preview-error", error: describeCommandError(error) });
     } finally {
       livePreviewBusy = false;
       if (livePreviewDirty) {
@@ -3888,7 +3888,7 @@ async function setTextContent(params) {
       fontName: node.fontName,
     };
   } catch (error) {
-    throw new Error(`Error setting text content: ${error.message}`);
+    throw new Error(`Error setting text content: ${describeCommandError(error)}`);
   }
 }
 
@@ -4272,11 +4272,11 @@ async function scanTextNodes(params) {
         0,
         0,
         0,
-        `Error scanning text nodes: ${error.message}`,
-        { error: error.message }
+        `Error scanning text nodes: ${describeCommandError(error)}`,
+        { error: describeCommandError(error) }
       );
 
-      throw new Error(`Error scanning text nodes: ${error.message}`);
+      throw new Error(`Error scanning text nodes: ${describeCommandError(error)}`);
     }
   }
 
@@ -4368,7 +4368,7 @@ async function scanTextNodes(params) {
             chunkTextNodes.push(textNodeInfo);
           }
         } catch (error) {
-          console.error(`Error processing text node: ${error.message}`);
+          console.error(`Error processing text node: ${describeCommandError(error)}`);
           // Continue with other nodes
         }
       }
@@ -4799,12 +4799,12 @@ async function setMultipleTextContents(params) {
         };
       } catch (error) {
         console.error(
-          `Error replacing text in node ${replacement.nodeId}: ${error.message}`
+          `Error replacing text in node ${replacement.nodeId}: ${describeCommandError(error)}`
         );
         return {
           success: false,
           nodeId: replacement.nodeId,
-          error: `Error applying replacement: ${error.message}`,
+          error: `Error applying replacement: ${describeCommandError(error)}`,
         };
       }
     });
@@ -5086,11 +5086,11 @@ async function setAnnotation(params) {
   } catch (error) {
     console.error("=== setAnnotation Error ===");
     console.error("Error details:", {
-      message: error.message,
+      message: describeCommandError(error),
       stack: error.stack,
       params: JSON.stringify(params, null, 2),
     });
-    return { success: false, error: error.message };
+    return { success: false, error: describeCommandError(error) };
   }
 }
 
@@ -5321,12 +5321,12 @@ async function setMultipleAnnotations(params) {
       const errorResult = {
         success: false,
         nodeId: annotation.nodeId,
-        error: error.message,
+        error: describeCommandError(error),
       };
       results.push(errorResult);
       console.error(`✗ Annotation ${i + 1} failed with error:`, error);
       console.error("Error details:", {
-        message: error.message,
+        message: describeCommandError(error),
         stack: error.stack,
       });
     }
@@ -5466,11 +5466,11 @@ async function deleteMultipleNodes(params) {
           nodeInfo: nodeInfo,
         };
       } catch (error) {
-        console.error(`Error deleting node ${nodeId}: ${error.message}`);
+        console.error(`Error deleting node ${nodeId}: ${describeCommandError(error)}`);
         return {
           success: false,
           nodeId: nodeId,
-          error: error.message,
+          error: describeCommandError(error),
         };
       }
     });
@@ -5623,10 +5623,10 @@ async function getInstanceOverrides(instanceNode = null) {
     return returnData;
   } catch (error) {
     console.error("Error in getInstanceOverrides:", error);
-    figma.notify(`Error: ${error.message}`);
+    figma.notify(`Error: ${describeCommandError(error)}`);
     return {
       success: false,
-      message: `Error: ${error.message}`
+      message: `Error: ${describeCommandError(error)}`
     };
   }
 }
@@ -5749,7 +5749,7 @@ async function setInstanceOverrides(targetInstances, sourceResult) {
             success: false,
             instanceId: targetInstance.id,
             instanceName: targetInstance.name,
-            message: `Error: ${error.message}`
+            message: `Error: ${describeCommandError(error)}`
           });
         }
 
@@ -5866,7 +5866,7 @@ async function setInstanceOverrides(targetInstances, sourceResult) {
 
   } catch (error) {
     console.error("Error in setInstanceOverrides:", error);
-    const message = `Error: ${error.message}`;
+    const message = `Error: ${describeCommandError(error)}`;
     figma.notify(message);
     return { success: false, message };
   }
@@ -6216,11 +6216,11 @@ async function setDefaultConnector(params) {
             console.log(`Stored connector ID ${existingConnectorId} is no longer valid, finding a new connector...`);
           }
         } catch (error) {
-          console.log(`Error finding stored connector: ${error.message}. Will try to set a new one.`);
+          console.log(`Error finding stored connector: ${describeCommandError(error)}. Will try to set a new one.`);
         }
       }
     } catch (error) {
-      console.log(`Error checking for existing connector: ${error.message}`);
+      console.log(`Error checking for existing connector: ${describeCommandError(error)}`);
     }
     
     // If there is no stored default connector or it is invalid, find one in the current page
@@ -6248,7 +6248,7 @@ async function setDefaultConnector(params) {
       }
     } catch (error) {
       // Error occurred while running findAllWithCriteria
-      throw new Error(`Failed to find a connector: ${error.message}`);
+      throw new Error(`Failed to find a connector: ${describeCommandError(error)}`);
     }
   }
 }
@@ -6356,7 +6356,7 @@ async function createCursorNode(targetNodeId) {
     
   } catch (error) {
     console.error("Error creating cursor from SVG:", error);
-    return { id: null, node: null, error: error.message };
+    return { id: null, node: null, error: describeCommandError(error) };
   }
 }
 
@@ -6531,11 +6531,11 @@ async function createConnections(params) {
         processedCount / totalCount,
         totalCount,
         processedCount,
-        `Error creating connection: ${error.message}`
+        `Error creating connection: ${describeCommandError(error)}`
       );
       
       results.push({
-        error: error.message,
+        error: describeCommandError(error),
         connectionInfo: connections[i]
       });
     }
