@@ -446,89 +446,88 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
     // where get_node_info on a page serialises its whole subtree.
     const info: any = await timed("read", () => runCommand(channel, "get_document_info", {}, DEEP_COMMAND_MS));
     const childrenOf = (payload: any): any[] => payload?.children || payload?.node?.children || [];
-    const candidates: any[] = childrenOf(info).filter((child: any) => child?.id);
 
-    // GW_Product's current page is empty, so the probe kept reporting "no
-    // image target" and its export path was never actually exercised — the
-    // heaviest thing the plugin does went untested on the file most likely to
-    // break. get_document_info takes a pageId, so look at a couple of other
-    // pages without moving anyone's current page.
-    if (!candidates.length) {
-      for (const page of list.filter((entry: any) => entry?.id && entry.id !== currentId).slice(0, 2)) {
-        const elsewhere: any = await timed("read2", () =>
-          runCommand(channel, "get_document_info", { pageId: page.id }, DEEP_COMMAND_MS));
-        for (const child of childrenOf(elsewhere)) if (child?.id) candidates.push(child);
-        if (candidates.length) break;
-      }
-    }
-    if (!candidates.length) {
-      return { project: name, ok: true, ms: Date.now() - probeStarted,
-        detail: `${loadNote} · ${list.length} pages, selection ok, 내용 있는 페이지 없음 · ${timings.join(" · ")}` };
-    }
-
-    // Try more than the first child.
+    // Finding something exportable means moving between pages, not just
+    // looking further down one.
     //
-    // The first child of GW_Product's 레퍼런스 page is a 5458x2423 SECTION with
-    // nothing visible in it, and Figma refuses to export that: it throws the
-    // string "Failed to export node. This node may not have any visible
-    // layers." Taking only the first child therefore paged Garen every 35
-    // minutes about a file whose plugin was answering everything correctly.
+    // GW_Product's current page is empty, so the probe fell through to the
+    // 레퍼런스 page — where all 45 top-level nodes refuse to export. Trying
+    // more of them cannot help: measured 2026-09-09, the first sixteen all
+    // failed. The page itself is the wrong place to look, so when a page
+    // gives up nothing the probe now moves to the next one.
     //
-    // A node that cannot be exported is a fact about that node, not an outage,
-    // so it is worth saying out loud rather than counting as a failure — but
-    // only once every candidate has refused for the same reason. Any other
-    // error is still a real failure on the first candidate that hits it.
-    const unexportable = (text: string) =>
-      /failed to export node|visible layers/i.test(text);
-    // One budget for the whole search, not one per candidate.
-    //
-    // Giving each attempt its own DEEP_COMMAND_MS meant four could spend 180s,
-    // and the deep probe always measures twice — 360s against a 300s cycle.
-    // These candidates are 5458x2423 sections; exporting four of them in one
-    // go timed out and dropped the plugin while this bug was being traced.
-    // Four was too few to actually test anything.
-    //
-    // GW_Product's 레퍼런스 page holds 45 top-level nodes and the first four
-    // all refuse, so the probe stopped there and never exported anything on
-    // the one file this export path exists to cover. A refusal costs ~30ms
-    // measured, not the seconds assumed when the cap was set, so looking
-    // further is nearly free and the shared budget below still bounds it.
-    const EXPORT_CANDIDATES = 12;
+    // The per-page cap stays small because a refusal is NOT uniformly cheap.
+    // On that page the first eight refused in 90-136ms and the next eight took
+    // 2.8s to 14s, so a generous count is a slow probe waiting to happen. The
+    // shared budget below is what actually bounds this; the count only keeps
+    // any single page from eating it.
+    const EXPORT_PER_PAGE = 5;
+    const EXPORT_PAGES = 4;
     const EXPORT_BUDGET_MS = DEEP_COMMAND_MS * 2;
     const exportDeadline = Date.now() + EXPORT_BUDGET_MS;
+    const unexportable = (text: string) =>
+      /failed to export node|visible layers/i.test(text);
+
     // The reason is known where the failure happens. Recovering it later by
     // running the regex over "name: message" let a node named after what it
     // contains ("visible layers audit") turn a real failure into a pass.
     const refusals: { text: string; refused: boolean }[] = [];
     let bytes: any = null;
     let usedTarget: any = null;
+    let usedPage: string | null = null;
     let tried = 0;
+    let seen = 0;
+    let pagesLooked = 0;
     let ranOutOfTime = false;
-    for (const candidate of candidates.slice(0, EXPORT_CANDIDATES)) {
-      const left = exportDeadline - Date.now();
-      if (left <= 0) { ranOutOfTime = true; break; }
-      tried++;
-      const label = candidate.name || candidate.id;
-      let image: any;
-      const attemptStarted = Date.now();
-      try {
-        image = await timed("image", () => runCommand(channel, "export_node_as_image",
-          { nodeId: candidate.id, format: "PNG", scale: 0.05 }, Math.min(DEEP_COMMAND_MS, left)));
-      } catch (error) {
-        // timed() only records a step once it resolves, so a throw leaves the
-        // seconds it burned out of the breakdown entirely — which is exactly
-        // the case where the card needs to explain a slow probe.
-        timings.push(`image(실패) ${Date.now() - attemptStarted}ms`);
-        const text = error instanceof Error ? error.message : String(error);
-        if (!unexportable(text)) throw error;
-        refusals.push({ text: `${label}: ${text}`, refused: true });
-        continue;
+
+    const tryPage = async (label: string, payload: any): Promise<boolean> => {
+      const candidates = childrenOf(payload).filter((child: any) => child?.id);
+      if (!candidates.length) return false;
+      pagesLooked++;
+      seen += candidates.length;
+      for (const candidate of candidates.slice(0, EXPORT_PER_PAGE)) {
+        const left = exportDeadline - Date.now();
+        if (left <= 0) { ranOutOfTime = true; return false; }
+        tried++;
+        const nodeLabel = candidate.name || candidate.id;
+        const attemptStarted = Date.now();
+        let image: any;
+        try {
+          image = await timed("image", () => runCommand(channel, "export_node_as_image",
+            { nodeId: candidate.id, format: "PNG", scale: 0.05 }, Math.min(DEEP_COMMAND_MS, left)));
+        } catch (error) {
+          // timed() only records a step once it resolves, so a throw leaves the
+          // seconds it burned out of the breakdown entirely — which is exactly
+          // the case where the card has to explain a slow probe.
+          timings.push(`image(실패) ${Date.now() - attemptStarted}ms`);
+          const text = error instanceof Error ? error.message : String(error);
+          if (!unexportable(text)) throw error;
+          refusals.push({ text: `${label}/${nodeLabel}: ${text}`, refused: true });
+          continue;
+        }
+        const got = imageBytes(image);
+        if (got) { bytes = got; usedTarget = candidate; usedPage = label; return true; }
+        refusals.push({ text: `${label}/${nodeLabel}: 응답에 이미지 없음`, refused: false });
       }
-      const got = imageBytes(image);
-      if (got) { bytes = got; usedTarget = candidate; break; }
-      refusals.push({ text: `${label}: 응답에 이미지 없음`, refused: false });
+      return false;
+    };
+
+    let done = await tryPage(info?.name || "현재 페이지", info);
+    if (!done && !ranOutOfTime) {
+      for (const page of list.filter((entry: any) => entry?.id && entry.id !== currentId).slice(0, EXPORT_PAGES)) {
+        if (ranOutOfTime || Date.now() >= exportDeadline) { ranOutOfTime = true; break; }
+        const elsewhere: any = await timed("read2", () =>
+          runCommand(channel, "get_document_info", { pageId: page.id }, DEEP_COMMAND_MS));
+        done = await tryPage(page.name || page.id, elsewhere);
+        if (done) break;
+      }
     }
-    const scope = `${tried}/${candidates.length}개 시도`;
+
+    if (!seen) {
+      return { project: name, ok: true, ms: Date.now() - probeStarted,
+        detail: `${loadNote} · ${list.length} pages, selection ok, 내용 있는 페이지 없음 · ${timings.join(" · ")}` };
+    }
+    const scope = `${pagesLooked}개 페이지에서 ${tried}/${seen}개 시도`;
     if (!bytes) {
       const allRefused = !ranOutOfTime && refusals.length > 0
         && refusals.every((entry) => entry.refused);
@@ -545,7 +544,7 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
     const skipped = refusals.length ? `, ${refusals.length}개 건너뜀` : "";
     return { project: name, ok: true, ms: Date.now() - probeStarted,
       detail: `${loadNote} · ${list.length} pages, selection ok, node read, `
-        + `image ${sizeOf(bytes)}${skipped} (${usedTarget.name || usedTarget.id}) · ${timings.join(" · ")}` };
+        + `image ${sizeOf(bytes)}${skipped} (${usedPage}/${usedTarget.name || usedTarget.id}) · ${timings.join(" · ")}` };
   } catch (error) {
     // A probe that fails after switching pages must not leave the document
     // parked somewhere the person working in it did not put it.
