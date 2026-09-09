@@ -480,33 +480,59 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
     // error is still a real failure on the first candidate that hits it.
     const unexportable = (text: string) =>
       /failed to export node|visible layers/i.test(text);
+    // One budget for the whole search, not one per candidate.
+    //
+    // Giving each attempt its own DEEP_COMMAND_MS meant four could spend 180s,
+    // and the deep probe always measures twice — 360s against a 300s cycle.
+    // These candidates are 5458x2423 sections; exporting four of them in one
+    // go timed out and dropped the plugin while this bug was being traced.
+    const EXPORT_BUDGET_MS = DEEP_COMMAND_MS * 2;
+    const exportDeadline = Date.now() + EXPORT_BUDGET_MS;
+    // The reason is known where the failure happens. Recovering it later by
+    // running the regex over "name: message" let a node named after what it
+    // contains ("visible layers audit") turn a real failure into a pass.
+    const refusals: { text: string; refused: boolean }[] = [];
     let bytes: any = null;
     let usedTarget: any = null;
-    const refusals: string[] = [];
+    let tried = 0;
+    let ranOutOfTime = false;
     for (const candidate of candidates.slice(0, 4)) {
+      const left = exportDeadline - Date.now();
+      if (left <= 0) { ranOutOfTime = true; break; }
+      tried++;
+      const label = candidate.name || candidate.id;
       let image: any;
+      const attemptStarted = Date.now();
       try {
         image = await timed("image", () => runCommand(channel, "export_node_as_image",
-          { nodeId: candidate.id, format: "PNG", scale: 0.05 }, DEEP_COMMAND_MS));
+          { nodeId: candidate.id, format: "PNG", scale: 0.05 }, Math.min(DEEP_COMMAND_MS, left)));
       } catch (error) {
+        // timed() only records a step once it resolves, so a throw leaves the
+        // seconds it burned out of the breakdown entirely — which is exactly
+        // the case where the card needs to explain a slow probe.
+        timings.push(`image(실패) ${Date.now() - attemptStarted}ms`);
         const text = error instanceof Error ? error.message : String(error);
         if (!unexportable(text)) throw error;
-        refusals.push(`${candidate.name || candidate.id}: ${text}`);
+        refusals.push({ text: `${label}: ${text}`, refused: true });
         continue;
       }
       const got = imageBytes(image);
       if (got) { bytes = got; usedTarget = candidate; break; }
-      refusals.push(`${candidate.name || candidate.id}: 응답에 이미지 없음`);
+      refusals.push({ text: `${label}: 응답에 이미지 없음`, refused: false });
     }
+    const scope = `${tried}/${candidates.length}개 시도`;
     if (!bytes) {
-      const allRefused = refusals.length > 0 && refusals.every((line) => unexportable(line));
+      const allRefused = !ranOutOfTime && refusals.length > 0
+        && refusals.every((entry) => entry.refused);
       if (allRefused) {
         return { project: name, ok: true, ms: Date.now() - probeStarted,
           detail: `${loadNote} · ${list.length} pages, selection ok, node read, `
-            + `이미지 내보내기 대상 없음(보이는 레이어 없는 노드 ${refusals.length}개) · ${timings.join(" · ")}` };
+            + `이미지 내보내기 대상 없음(보이는 레이어 없는 노드, ${scope}) · ${timings.join(" · ")}` };
       }
+      const why = ranOutOfTime ? `${scope}, 시간 초과` : scope;
       return { project: name, ok: false, ms: Date.now() - probeStarted,
-        detail: `image export returned nothing — ${refusals.join(" · ") || "후보 없음"} · ${timings.join(" · ")}` };
+        detail: `image export returned nothing (${why}) — `
+          + `${refusals.map((entry) => entry.text).join(" · ") || "후보 없음"} · ${timings.join(" · ")}` };
     }
     const skipped = refusals.length ? `, ${refusals.length}개 건너뜀` : "";
     return { project: name, ok: true, ms: Date.now() - probeStarted,
