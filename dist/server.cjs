@@ -2870,9 +2870,11 @@ This strategy enables transferring content and property overrides from a source 
       nodeId: import_zod.z.string().describe("Node ID whose subtree to read documentation from"),
       maxDepth: import_zod.z.number().int().min(0).optional().describe("How many levels below the node to include. Defaults to 6."),
       includeDevResources: import_zod.z.boolean().optional().describe(
-        "Also fetch dev-mode resources per node. Off by default: this is a network round trip per node and fetching it while walking a page has hung the plugin."
+        "Also fetch dev-mode resources. Off by default: this is a network round trip per node and fetching it while walking a page has hung the plugin."
       ),
-      devResourceLimit: import_zod.z.number().int().min(1).max(200).optional().describe("Max nodes to fetch dev resources for. Defaults to 20.")
+      devResourceLimit: import_zod.z.number().int().min(1).max(200).optional().describe(
+        "Max nodes to fetch dev resources for, applied to the nodes that already carry documentation rather than to the whole subtree. Defaults to 20."
+      )
     },
     async ({ nodeId, maxDepth, includeDevResources, devResourceLimit }) => {
       try {

@@ -2189,6 +2189,7 @@ async function getDocumentation(params) {
   const root = await figma.getNodeByIdAsync(nodeId);
   if (!root) throw new Error(`Node not found: ${nodeId}`);
   const maxDepth = Number.isFinite(maxDepthParam) ? Math.max(0, Math.floor(maxDepthParam)) : 6;
+  const commandId = generateCommandId();
 
   const safe = (fn) => {
     try {
@@ -2216,11 +2217,30 @@ async function getDocumentation(params) {
   }
 
   const results = [];
-  const devResourceTargets = [];
+  // Node handles for the entries we keep, so the dev-resource pass can call
+  // back into them without a second traversal or a getNodeByIdAsync per node.
+  const nodesById = {};
   let scanned = 0;
+  let lastProgressAt = Date.now();
 
   const walk = (node, depth) => {
     scanned++;
+    // A subtree scan with no progress trips the 30s per-command inactivity
+    // timeout, which is why getReactions reports from inside its scan too.
+    // 22,763 nodes took 6.6s measured; larger pages exist.
+    if (Date.now() - lastProgressAt > 2000) {
+      lastProgressAt = Date.now();
+      sendProgressUpdate(
+        commandId,
+        "get_documentation",
+        "in_progress",
+        50,
+        scanned,
+        scanned,
+        `Scanning… visited ${scanned} nodes, found ${results.length} documented`,
+        null
+      );
+    }
     const entry = { id: node.id, name: node.name, type: node.type, depth };
     let found = false;
 
@@ -2266,12 +2286,10 @@ async function getDocumentation(params) {
       found = true;
     }
 
-    if (includeDevResources && devResourceTargets.length < devResourceLimit &&
-        typeof safe(() => node.getDevResourcesAsync) === "function") {
-      devResourceTargets.push(node);
+    if (found) {
+      results.push(entry);
+      nodesById[entry.id] = node;
     }
-
-    if (found) results.push(entry);
     if (depth < maxDepth && "children" in node) {
       for (const child of node.children) walk(child, depth + 1);
     }
@@ -2279,32 +2297,51 @@ async function getDocumentation(params) {
   walk(root, 0);
 
   // Dev resources after the walk, so a slow network call cannot stall the
-  // traversal, and never more than devResourceLimit of them.
+  // traversal.
+  //
+  // The budget is spent on nodes that ALREADY carry documentation, not on the
+  // first N the walk happened to touch. Almost every SceneNode exposes
+  // getDevResourcesAsync, so admitting candidates during traversal burned the
+  // whole allowance on a page's opening frames: on a 22,763-node page the 13
+  // documented nodes sit at depths 2-6 and would never have been reached.
+  // A node already worth reporting is the one whose dev links a caller wants.
   let devResourcesTruncated = false;
   if (includeDevResources) {
-    devResourcesTruncated = devResourceTargets.length >= devResourceLimit;
-    const byId = {};
-    for (const entry of results) byId[entry.id] = entry;
-    for (const node of devResourceTargets) {
+    const targets = [];
+    for (const entry of results) {
+      if (typeof safe(() => nodesById[entry.id].getDevResourcesAsync) === "function") {
+        targets.push(entry);
+      }
+    }
+    // Truncated means work was left undone, which is only true when more
+    // targets existed than the limit — not when they fit exactly.
+    devResourcesTruncated = targets.length > devResourceLimit;
+    for (const entry of targets.slice(0, devResourceLimit)) {
       let resources;
       try {
-        resources = await node.getDevResourcesAsync();
+        resources = await nodesById[entry.id].getDevResourcesAsync();
       } catch (_) {
         continue;
       }
       if (!resources || !resources.length) continue;
-      const entry = byId[node.id] || { id: node.id, name: node.name, type: node.type };
       entry.devResources = resources.map((resource) => ({
         name: resource.name,
         url: resource.url,
         inheritedNodeId: resource.inheritedNodeId,
       }));
-      if (!byId[node.id]) {
-        byId[node.id] = entry;
-        results.push(entry);
-      }
     }
   }
+
+  await sendProgressUpdate(
+    commandId,
+    "get_documentation",
+    "completed",
+    100,
+    scanned,
+    scanned,
+    `Scanned ${scanned} nodes, ${results.length} carry documentation`,
+    null
+  );
 
   const count = (key) => results.filter((entry) => entry[key]).length;
   return {
