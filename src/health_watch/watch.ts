@@ -463,6 +463,7 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
     // any single page from eating it.
     const EXPORT_PER_PAGE = 5;
     const EXPORT_PAGES = 4;
+    const PAGE_OPEN_MS = Number(process.env.HEALTH_PAGE_OPEN_MS || 4_000);
     const EXPORT_BUDGET_MS = DEEP_COMMAND_MS * 2;
     const exportDeadline = Date.now() + EXPORT_BUDGET_MS;
     const unexportable = (text: string) =>
@@ -529,9 +530,20 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
         const readStarted = Date.now();
         let elsewhere: any;
         try {
+          // Short leash on opening a page, because a slow open never pays off.
+          //
+          // Three of GW_Product's pages take Figma's full 10s window and then
+          // refuse, so the probe spent 33.4s where every other project takes
+          // 0.1-0.5s. Waiting the full DEEP_COMMAND_MS on them buys nothing:
+          // a page that cannot be opened promptly is not a page to export
+          // from, and the next one is likelier to work than this one is on a
+          // second thought. childCount would let this pick small pages first,
+          // but list_pages is deliberately called with withChildCounts:false
+          // (that flag is what used to make this probe take 22s), so the
+          // count is not available to sort by.
           elsewhere = await timed("read2", () =>
             runCommand(channel, "get_document_info", { pageId: page.id },
-              Math.min(DEEP_COMMAND_MS, Math.max(1, exportDeadline - Date.now()))));
+              Math.min(PAGE_OPEN_MS, Math.max(1, exportDeadline - Date.now()))));
         } catch (error) {
           timings.push(`read2(실패) ${Date.now() - readStarted}ms`);
           unopened.push(`${pageLabel}: ${error instanceof Error ? error.message : String(error)}`);
