@@ -379,7 +379,9 @@ async function handleCommand(command, params) {
       if (!params || !params.nodeId) {
         throw new Error("Missing nodeId parameter");
       }
-      return await getMotion(params.nodeId, params.maxDepth);
+      return await getMotion(params.nodeId, params.maxDepth, params.includeAnimationStyleSchemas);
+    case "get_documentation":
+      return await getDocumentation(params);
     case "set_default_connector":
       return await setDefaultConnector(params);
     case "create_connections":
@@ -1677,6 +1679,32 @@ function filterFigmaNode(node, opts) {
     filtered.cornerRadius = node.cornerRadius;
   }
 
+  // Documentation the designer attached. Every field here is absent on most
+  // nodes, so this adds nothing to the common payload — but when a component
+  // description or a dev-mode annotation exists it is usually the single most
+  // useful thing on the node, and until now no read command returned it.
+  if (node.description) {
+    filtered.description = node.description;
+  }
+  if (node.documentationLinks && node.documentationLinks.length > 0) {
+    filtered.documentationLinks = node.documentationLinks.map(function (link) {
+      return { uri: link.uri };
+    });
+  }
+  if (node.annotations && node.annotations.length > 0) {
+    filtered.annotations = node.annotations.map(function (annotation) {
+      return {
+        label: annotation.label,
+        labelMarkdown: annotation.labelMarkdown,
+        categoryId: annotation.categoryId,
+      };
+    });
+  }
+  // null until somebody marks the frame, which is the majority of frames.
+  if (node.devStatus) {
+    filtered.devStatus = node.devStatus;
+  }
+
   if (node.absoluteBoundingBox) {
     filtered.absoluteBoundingBox = node.absoluteBoundingBox;
   }
@@ -2029,7 +2057,7 @@ async function getFrameContext(params) {
  * Beta API: every property access is guarded so an older Figma desktop build
  * just yields `supported: false` instead of throwing.
  */
-async function getMotion(nodeId, maxDepthParam) {
+async function getMotion(nodeId, maxDepthParam, includeAnimationStyleSchemas) {
   const root = await figma.getNodeByIdAsync(nodeId);
   if (!root) throw new Error(`Node not found: ${nodeId}`);
   const maxDepth = Number.isFinite(maxDepthParam) ? Math.max(0, Math.floor(maxDepthParam)) : 6;
@@ -2059,18 +2087,30 @@ async function getMotion(nodeId, maxDepthParam) {
     return out;
   };
 
+  // A `timelines` entry is NOT evidence of animation.
+  //
+  // Every node inherits the timeline of the top-level frame it sits in, so
+  // `node.timelines` reads as `[{id: <that frame>, duration: 2}]` on plain
+  // rectangles, vectors and text that have never been animated. Measured
+  // 2026-09-09 across PAGE/SECTION/FRAME/INSTANCE/TEXT/RECTANGLE/VECTOR/GROUP/
+  // ELLIPSE/BOOLEAN_OPERATION: every one of them carried a timeline and an
+  // empty `animations`. Treating that as motion made this command return the
+  // whole subtree as animated, which is the same as returning nothing.
+  //
+  // Real motion lives in `animations` (keyframes per animatable field),
+  // `manualKeyframeTracks`, or an applied `animationStyles` entry.
   const results = [];
+  let scanned = 0;
   const walk = (node, depth) => {
+    scanned++;
     const animations = safe(() => node.animations);
     const tracks = safe(() => node.manualKeyframeTracks);
     const timelines = safe(() => node.timelines);
     const styles = safe(() => node.animationStyles);
-    const hasAny =
-      (animations && Object.keys(plain(animations) || {}).length > 0) ||
-      (tracks && tracks.length > 0) ||
-      (timelines && timelines.length > 0) ||
-      (styles && styles.length > 0);
-    if (hasAny) {
+    const animationCount = animations ? Object.keys(plain(animations) || {}).length : 0;
+    const trackCount = tracks ? Object.keys(plain(tracks) || {}).length : 0;
+    const styleCount = styles && styles.length ? styles.length : 0;
+    if (animationCount > 0 || trackCount > 0 || styleCount > 0) {
       results.push({
         id: node.id,
         name: node.name,
@@ -2078,6 +2118,7 @@ async function getMotion(nodeId, maxDepthParam) {
         depth,
         animations: plain(animations),
         manualKeyframeTracks: plain(tracks),
+        // Kept for context: which timeline these keyframes are placed on.
         timelines: plain(timelines),
         animationStyles: plain(styles),
       });
@@ -2088,12 +2129,239 @@ async function getMotion(nodeId, maxDepthParam) {
   };
   walk(root, 0);
 
+  const rawStyles = safe(() => figma.motion && figma.motion.figmaAnimationStyles());
+  const animationStyleCatalog = Array.isArray(rawStyles)
+    ? (includeAnimationStyleSchemas
+        ? plain(rawStyles)
+        : rawStyles.map((style) => ({ styleId: safe(() => style.styleId), name: safe(() => style.name) })))
+    : plain(rawStyles);
+
   return {
     // `animations` missing entirely on the root means this Figma build predates Motion.
     supported: safe(() => root.animations) !== undefined,
-    documentTimelines: plain(safe(() => figma.motion && figma.motion.timelines)),
-    availableAnimationStyles: plain(safe(() => figma.motion && figma.motion.animationStyles)),
+    // The timeline the root sits on (id + duration in seconds). Inherited, so
+    // it describes the containing frame, not the root itself.
+    timeline: plain(safe(() => root.timelines)),
+    // figma.motion exposes exactly these: playheadPosition (a getter, undefined
+    // outside an active motion-editing context), figmaAnimationStyles and
+    // physicalSpringToNormalized. It has no `timelines` and no
+    // `animationStyles`, which is what this used to read — both were always
+    // undefined, so the two fields they fed were always null.
+    playheadPosition: plain(safe(() => figma.motion && figma.motion.playheadPosition)),
+    // figmaAnimationStyles is a FUNCTION, not a value, and returns Figma's six
+    // built-in motion presets. Each carries a paragraph of prose plus a full
+    // prop schema — roughly 10KB — so the catalogue is summarised by default
+    // and only spelled out when asked for. Reading it as a property (which is
+    // the mistake that hid it) yields a function object and then nothing.
+    figmaAnimationStyles: animationStyleCatalog,
+    scanned: scanned,
+    maxDepth: maxDepth,
     nodesWithMotion: results.length,
+    nodes: results,
+  };
+}
+
+/**
+ * Read every piece of prose attached to a node subtree.
+ *
+ * Figma spreads documentation across four unrelated surfaces and no single
+ * command showed any of them, so answering "what did the designer write about
+ * this screen" meant guessing:
+ *
+ *   description / descriptionMarkdown  design mode, COMPONENT + COMPONENT_SET only
+ *   documentationLinks                 design mode "documentation link", same types
+ *   annotations                        dev mode notes, most SceneNodes
+ *   devStatus                          dev mode "Ready for dev"
+ *   dev resources                      dev mode links attached to a node
+ *
+ * Comments are deliberately absent: the Plugin API has no `figma.comments`
+ * (verified 2026-09-09, typeof is "undefined"), so a plugin cannot read them at
+ * all. They are reachable only through the REST API with a file token.
+ *
+ * Dev resources are opt-in and capped because `getDevResourcesAsync` is a
+ * network round trip per node: calling it while walking a page hung the plugin
+ * hard enough to drop its relay connection.
+ */
+async function getDocumentation(params) {
+  const { nodeId, maxDepth: maxDepthParam, includeDevResources = false, devResourceLimit = 20 } =
+    params || {};
+  if (!nodeId) throw new Error("Missing nodeId parameter");
+  const root = await figma.getNodeByIdAsync(nodeId);
+  if (!root) throw new Error(`Node not found: ${nodeId}`);
+  const maxDepth = Number.isFinite(maxDepthParam) ? Math.max(0, Math.floor(maxDepthParam)) : 6;
+  const commandId = generateCommandId();
+
+  const safe = (fn) => {
+    try {
+      return fn();
+    } catch (_) {
+      return undefined;
+    }
+  };
+
+  // Resolve annotation categories once. A categoryId on its own means nothing
+  // to a reader; the label ("Spec", "Note") is the part worth having.
+  let categories = {};
+  try {
+    const list = await figma.annotations.getAnnotationCategoriesAsync();
+    for (const category of list) {
+      categories[category.id] = {
+        id: category.id,
+        label: category.label,
+        color: category.color,
+        isPreset: category.isPreset,
+      };
+    }
+  } catch (_) {
+    categories = {};
+  }
+
+  const results = [];
+  // Node handles for the entries we keep, so the dev-resource pass can call
+  // back into them without a second traversal or a getNodeByIdAsync per node.
+  const nodesById = {};
+  let scanned = 0;
+  let lastProgressAt = Date.now();
+
+  const walk = (node, depth) => {
+    scanned++;
+    // A subtree scan with no progress trips the 30s per-command inactivity
+    // timeout, which is why getReactions reports from inside its scan too.
+    // 22,763 nodes took 6.6s measured; larger pages exist.
+    if (Date.now() - lastProgressAt > 2000) {
+      lastProgressAt = Date.now();
+      sendProgressUpdate(
+        commandId,
+        "get_documentation",
+        "in_progress",
+        50,
+        scanned,
+        scanned,
+        `Scanning… visited ${scanned} nodes, found ${results.length} documented`,
+        null
+      );
+    }
+    const entry = { id: node.id, name: node.name, type: node.type, depth };
+    let found = false;
+
+    // Design mode. Only components carry these; every other type lacks the key
+    // entirely, so an empty string here means "author left it blank", which is
+    // different from "this type cannot have one".
+    const description = safe(() => ("description" in node ? node.description : undefined));
+    if (description) {
+      entry.description = description;
+      found = true;
+    }
+    const descriptionMarkdown = safe(() =>
+      "descriptionMarkdown" in node ? node.descriptionMarkdown : undefined
+    );
+    if (descriptionMarkdown && descriptionMarkdown !== description) {
+      entry.descriptionMarkdown = descriptionMarkdown;
+      found = true;
+    }
+    const links = safe(() => ("documentationLinks" in node ? node.documentationLinks : undefined));
+    if (links && links.length) {
+      entry.documentationLinks = links.map((link) => ({ uri: link.uri }));
+      found = true;
+    }
+
+    // Dev mode notes.
+    const annotations = safe(() => ("annotations" in node ? node.annotations : undefined));
+    if (annotations && annotations.length) {
+      entry.annotations = annotations.map((annotation) => ({
+        label: annotation.label,
+        labelMarkdown: annotation.labelMarkdown,
+        categoryId: annotation.categoryId,
+        category: annotation.categoryId ? categories[annotation.categoryId] || null : null,
+        properties: annotation.properties,
+      }));
+      found = true;
+    }
+
+    // devStatus is null on everything that has the key until someone marks the
+    // frame, so only a non-null value is worth reporting.
+    const devStatus = safe(() => ("devStatus" in node ? node.devStatus : undefined));
+    if (devStatus) {
+      entry.devStatus = devStatus;
+      found = true;
+    }
+
+    if (found) {
+      results.push(entry);
+      nodesById[entry.id] = node;
+    }
+    if (depth < maxDepth && "children" in node) {
+      for (const child of node.children) walk(child, depth + 1);
+    }
+  };
+  walk(root, 0);
+
+  // Dev resources after the walk, so a slow network call cannot stall the
+  // traversal.
+  //
+  // The budget is spent on nodes that ALREADY carry documentation, not on the
+  // first N the walk happened to touch. Almost every SceneNode exposes
+  // getDevResourcesAsync, so admitting candidates during traversal burned the
+  // whole allowance on a page's opening frames: on a 22,763-node page the 13
+  // documented nodes sit at depths 2-6 and would never have been reached.
+  // A node already worth reporting is the one whose dev links a caller wants.
+  let devResourcesTruncated = false;
+  if (includeDevResources) {
+    const targets = [];
+    for (const entry of results) {
+      if (typeof safe(() => nodesById[entry.id].getDevResourcesAsync) === "function") {
+        targets.push(entry);
+      }
+    }
+    // Truncated means work was left undone, which is only true when more
+    // targets existed than the limit — not when they fit exactly.
+    devResourcesTruncated = targets.length > devResourceLimit;
+    for (const entry of targets.slice(0, devResourceLimit)) {
+      let resources;
+      try {
+        resources = await nodesById[entry.id].getDevResourcesAsync();
+      } catch (_) {
+        continue;
+      }
+      if (!resources || !resources.length) continue;
+      entry.devResources = resources.map((resource) => ({
+        name: resource.name,
+        url: resource.url,
+        inheritedNodeId: resource.inheritedNodeId,
+      }));
+    }
+  }
+
+  await sendProgressUpdate(
+    commandId,
+    "get_documentation",
+    "completed",
+    100,
+    scanned,
+    scanned,
+    `Scanned ${scanned} nodes, ${results.length} carry documentation`,
+    null
+  );
+
+  const count = (key) => results.filter((entry) => entry[key]).length;
+  return {
+    root: { id: root.id, name: root.name, type: root.type },
+    scanned,
+    maxDepth,
+    // Comments are not a gap in this command — the Plugin API cannot see them.
+    commentsAvailable: false,
+    commentsNote:
+      "Figma's Plugin API exposes no comment access (figma.comments is undefined). File comments are readable only through the REST API GET /v1/files/:key/comments with a file token.",
+    summary: {
+      documented: results.length,
+      withDescription: count("description"),
+      withDocumentationLinks: count("documentationLinks"),
+      withAnnotations: count("annotations"),
+      withDevStatus: count("devStatus"),
+      withDevResources: count("devResources"),
+    },
+    devResourcesRequested: !!includeDevResources,
+    devResourcesTruncated,
     nodes: results,
   };
 }
@@ -3047,13 +3315,32 @@ async function getLocalComponents(params) {
 
     for (var j = 0; j < pageComponents.length; j++) {
       var component = pageComponents[j];
-      allComponents.push({
+      // A component's description is the one place the design system explains
+      // itself, and it was dropped here — leaving no command in the whole
+      // surface that could return it. Only emitted when non-empty, so the
+      // common case costs nothing.
+      var entry = {
         id: component.id,
         name: component.name,
         type: component.type,
         key: "key" in component ? component.key : null,
         remote: !!component.remote,
-      });
+      };
+      if (component.description) entry.description = component.description;
+      try {
+        if (component.descriptionMarkdown &&
+            component.descriptionMarkdown !== component.description) {
+          entry.descriptionMarkdown = component.descriptionMarkdown;
+        }
+      } catch (e) { /* older builds lack the property */ }
+      try {
+        if (component.documentationLinks && component.documentationLinks.length) {
+          entry.documentationLinks = component.documentationLinks.map(function (link) {
+            return { uri: link.uri };
+          });
+        }
+      } catch (e) { /* same */ }
+      allComponents.push(entry);
     }
 
     var progress = Math.round(((i + 1) / totalPages) * 100);

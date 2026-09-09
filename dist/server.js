@@ -451,6 +451,45 @@ function createMcpServer(options = {}) {
     if (!response.ok) throw new Error(result.error || `Gallery upload failed with HTTP ${response.status}`);
     return result;
   }
+  const PROJECT_ARG_EXEMPT = /* @__PURE__ */ new Set([
+    // 프로젝트를 고르거나 릴레이 자체를 보는 도구들 — 여기에 project 를 받으면 순환이다.
+    "join_channel",
+    "list_figma_channels",
+    "list_figma_projects",
+    "use_figma_project",
+    "get_figma_workload",
+    "list_relay_errors",
+    "get_bulk_operation",
+    "cancel_bulk_operation"
+  ]);
+  const PROJECT_ARG_DESCRIPTION = "Which Figma project/document this call targets (name, fileKey, or projectKey; see list_figma_projects). Pass this when you are not holding an MCP session across calls \u2014 without it the call falls back to the last selection, which another caller may have changed. Does not change the persisted default.";
+  let projectPinQueue = Promise.resolve();
+  function withPinnedProject(project, run) {
+    const next = projectPinQueue.then(async () => {
+      await selectProject(project, { persist: false });
+      return run();
+    });
+    projectPinQueue = next.then(() => void 0, () => void 0);
+    return next;
+  }
+  const registerTool = server.tool.bind(server);
+  server.tool = (name, description, shape, handler, ...rest) => {
+    if (typeof shape !== "object" || shape === null || typeof handler !== "function" || PROJECT_ARG_EXEMPT.has(name)) {
+      return registerTool(name, description, shape, handler, ...rest);
+    }
+    const shaped = { ...shape, project: z.string().optional().describe(PROJECT_ARG_DESCRIPTION) };
+    return registerTool(
+      name,
+      description,
+      shaped,
+      async (args2, extra) => {
+        const { project, ...forwarded } = args2 ?? {};
+        if (!project) return handler(args2, extra);
+        return withPinnedProject(String(project), () => handler(forwarded, extra));
+      },
+      ...rest
+    );
+  };
   server.tool(
     "get_document_info",
     "Get information about a Figma page: its top-level nodes plus a list of all pages in the file (so non-open pages are discoverable). Pass `pageId` to inspect a specific page without switching to it. If you know (part of) the name of what you're looking for, use search_nodes first instead of inspecting pages one by one; for a one-call overview of all pages use get_file_outline.",
@@ -1610,7 +1649,7 @@ Failed: ${JSON.stringify(failures)}` : "")
   );
   server.tool(
     "get_local_components",
-    "Get local components and component sets (id, name, type, key, remote). Supports pagination (`limit`/`offset`, with `total`/`nextOffset` in the response) and `countOnly` for large libraries.",
+    "Get local components and component sets (id, name, type, key, remote), plus the design-mode `description`, `descriptionMarkdown` and `documentationLinks` when the author wrote them. Supports pagination (`limit`/`offset`, with `total`/`nextOffset` in the response) and `countOnly` for large libraries.",
     {
       limit: z.number().int().positive().optional().describe("Max components to return; response includes total and nextOffset."),
       offset: z.number().int().min(0).optional().describe("Start index for pagination."),
@@ -2778,14 +2817,17 @@ This strategy enables transferring content and property overrides from a source 
   );
   server.tool(
     "get_motion",
-    "Read Figma Motion animation data (Animation panel) for a node and its descendants: `animations` keyframes per animatable field, `manualKeyframeTracks`, `timelines`, and applied `animationStyles`, plus the document's timelines and available animation styles. This is NOT prototype data \u2014 Motion animations are invisible to `get_reactions`. Use this to get exact durations, keyframe positions and easing for looping/ambient animations.",
+    "Read Figma Motion animation data (Animation panel) for a node and its descendants: `animations` (keyframes per animatable field), `manualKeyframeTracks` and applied `animationStyles`, with exact durations, keyframe positions and easing. A node is reported only when it carries one of those three \u2014 `timelines` alone is NOT motion, because every node inherits the timeline of the frame it sits in. `nodesWithMotion: 0` with a non-zero `scanned` therefore means the subtree genuinely has no Motion, not that the scan missed it. This is NOT prototype data: Motion animations are invisible to `get_reactions`, and prototype transitions are invisible here \u2014 check both.",
     {
       nodeId: z.string().describe("Node ID to read Motion data from (its subtree is included)"),
-      maxDepth: z.number().int().min(0).optional().describe("How many levels below the node to include. Defaults to 6.")
+      maxDepth: z.number().int().min(0).optional().describe("How many levels below the node to include. Defaults to 6."),
+      includeAnimationStyleSchemas: z.boolean().optional().describe(
+        "Spell out Figma's six built-in animation presets with their full descriptions and prop schemas (~10KB). Off by default, which returns just their ids and names."
+      )
     },
-    async ({ nodeId, maxDepth }) => {
+    async ({ nodeId, maxDepth, includeAnimationStyleSchemas }) => {
       try {
-        const result = await sendCommandToFigma("get_motion", { nodeId, maxDepth });
+        const result = await sendCommandToFigma("get_motion", { nodeId, maxDepth, includeAnimationStyleSchemas });
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       } catch (error) {
         return {
@@ -2793,6 +2835,40 @@ This strategy enables transferring content and property overrides from a source 
             {
               type: "text",
               text: `Error reading Motion data: ${error instanceof Error ? error.message : String(error)}`
+            }
+          ]
+        };
+      }
+    }
+  );
+  server.tool(
+    "get_documentation",
+    'Read every piece of prose attached to a node and its descendants, which Figma scatters across four unrelated surfaces: `description`/`descriptionMarkdown` (design mode, components and component sets only), `documentationLinks` (design mode documentation link), `annotations` (dev mode notes, with their category label resolved), `devStatus` ("Ready for dev"), and optionally dev resources (dev mode links). Only nodes that actually carry something are returned, and `scanned` reports how many were examined so an empty result is unambiguous. COMMENTS ARE NOT INCLUDED AND CANNOT BE: the Figma Plugin API exposes no comment access at all, so file comments are reachable only through the REST API (GET /v1/files/:key/comments) with a file token. Do not go looking for a plugin command that reads them.',
+    {
+      nodeId: z.string().describe("Node ID whose subtree to read documentation from"),
+      maxDepth: z.number().int().min(0).optional().describe("How many levels below the node to include. Defaults to 6."),
+      includeDevResources: z.boolean().optional().describe(
+        "Also fetch dev-mode resources. Off by default: this is a network round trip per node and fetching it while walking a page has hung the plugin."
+      ),
+      devResourceLimit: z.number().int().min(1).max(200).optional().describe(
+        "Max nodes to fetch dev resources for, applied to the nodes that already carry documentation rather than to the whole subtree. Defaults to 20."
+      )
+    },
+    async ({ nodeId, maxDepth, includeDevResources, devResourceLimit }) => {
+      try {
+        const result = await sendCommandToFigma("get_documentation", {
+          nodeId,
+          maxDepth,
+          includeDevResources,
+          devResourceLimit
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error reading documentation: ${error instanceof Error ? error.message : String(error)}`
             }
           ]
         };
@@ -3253,7 +3329,7 @@ If it reports "repair_in_progress" (exit 75), another machine is already repairi
       return [];
     }
   }
-  async function selectProject(query) {
+  async function selectProject(query, options2 = {}) {
     const projects = await relayProjects();
     const live = projects.filter((project2) => project2.connectionCount > 0 && project2.recommendedChannel);
     if (!live.length) {
@@ -3279,7 +3355,7 @@ If it reports "repair_in_progress" (exit 75), another machine is already repairi
     const project = matches[0];
     await joinChannel(project.recommendedChannel);
     selectedProject = { projectKey: project.projectKey, name: project.name, fileKey: project.fileKey };
-    persistSelectedProject(selectedProject);
+    if (options2.persist !== false) persistSelectedProject(selectedProject);
     return project;
   }
   function currentProjectKey() {

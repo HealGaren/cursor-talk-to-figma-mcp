@@ -1666,7 +1666,7 @@ server.tool(
 // Get Local Components Tool
 server.tool(
   "get_local_components",
-  "Get local components and component sets (id, name, type, key, remote). Supports pagination (`limit`/`offset`, with `total`/`nextOffset` in the response) and `countOnly` for large libraries.",
+  "Get local components and component sets (id, name, type, key, remote), plus the design-mode `description`, `descriptionMarkdown` and `documentationLinks` when the author wrote them. Supports pagination (`limit`/`offset`, with `total`/`nextOffset` in the response) and `countOnly` for large libraries.",
   {
     limit: z.number().int().positive().optional().describe("Max components to return; response includes total and nextOffset."),
     offset: z.number().int().min(0).optional().describe("Start index for pagination."),
@@ -3010,14 +3010,17 @@ server.tool(
 // A tool to read Figma Motion (Animation panel) data — keyframes, tracks, timelines
 server.tool(
   "get_motion",
-  "Read Figma Motion animation data (Animation panel) for a node and its descendants: `animations` keyframes per animatable field, `manualKeyframeTracks`, `timelines`, and applied `animationStyles`, plus the document's timelines and available animation styles. This is NOT prototype data — Motion animations are invisible to `get_reactions`. Use this to get exact durations, keyframe positions and easing for looping/ambient animations.",
+  "Read Figma Motion animation data (Animation panel) for a node and its descendants: `animations` (keyframes per animatable field), `manualKeyframeTracks` and applied `animationStyles`, with exact durations, keyframe positions and easing. A node is reported only when it carries one of those three — `timelines` alone is NOT motion, because every node inherits the timeline of the frame it sits in. `nodesWithMotion: 0` with a non-zero `scanned` therefore means the subtree genuinely has no Motion, not that the scan missed it. This is NOT prototype data: Motion animations are invisible to `get_reactions`, and prototype transitions are invisible here — check both.",
   {
     nodeId: z.string().describe("Node ID to read Motion data from (its subtree is included)"),
     maxDepth: z.number().int().min(0).optional().describe("How many levels below the node to include. Defaults to 6."),
+    includeAnimationStyleSchemas: z.boolean().optional().describe(
+      "Spell out Figma's six built-in animation presets with their full descriptions and prop schemas (~10KB). Off by default, which returns just their ids and names."
+    ),
   },
-  async ({ nodeId, maxDepth }: any) => {
+  async ({ nodeId, maxDepth, includeAnimationStyleSchemas }: any) => {
     try {
-      const result = await sendCommandToFigma("get_motion", { nodeId, maxDepth });
+      const result = await sendCommandToFigma("get_motion", { nodeId, maxDepth, includeAnimationStyleSchemas });
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (error) {
       return {
@@ -3025,6 +3028,50 @@ server.tool(
           {
             type: "text",
             text: `Error reading Motion data: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+// A tool to read everything written about a node: descriptions, dev-mode
+// annotations, dev status and dev resources.
+server.tool(
+  "get_documentation",
+  "Read every piece of prose attached to a node and its descendants, which Figma scatters across four unrelated surfaces: "
+  + "`description`/`descriptionMarkdown` (design mode, components and component sets only), "
+  + "`documentationLinks` (design mode documentation link), "
+  + "`annotations` (dev mode notes, with their category label resolved), "
+  + "`devStatus` (\"Ready for dev\"), and optionally dev resources (dev mode links). "
+  + "Only nodes that actually carry something are returned, and `scanned` reports how many were examined so an empty result is unambiguous. "
+  + "COMMENTS ARE NOT INCLUDED AND CANNOT BE: the Figma Plugin API exposes no comment access at all, so file comments are reachable only through the REST API "
+  + "(GET /v1/files/:key/comments) with a file token. Do not go looking for a plugin command that reads them.",
+  {
+    nodeId: z.string().describe("Node ID whose subtree to read documentation from"),
+    maxDepth: z.number().int().min(0).optional().describe("How many levels below the node to include. Defaults to 6."),
+    includeDevResources: z.boolean().optional().describe(
+      "Also fetch dev-mode resources. Off by default: this is a network round trip per node and fetching it while walking a page has hung the plugin."
+    ),
+    devResourceLimit: z.number().int().min(1).max(200).optional().describe(
+      "Max nodes to fetch dev resources for, applied to the nodes that already carry documentation rather than to the whole subtree. Defaults to 20."
+    ),
+  },
+  async ({ nodeId, maxDepth, includeDevResources, devResourceLimit }: any) => {
+    try {
+      const result = await sendCommandToFigma("get_documentation", {
+        nodeId,
+        maxDepth,
+        includeDevResources,
+        devResourceLimit,
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error reading documentation: ${error instanceof Error ? error.message : String(error)}`,
           },
         ],
       };
@@ -3348,6 +3395,7 @@ type FigmaCommand =
   | "set_layout_sizing"
   | "set_item_spacing"
   | "get_reactions"
+  | "get_documentation"
   | "get_motion"
   | "set_default_connector"
   | "create_connections"
