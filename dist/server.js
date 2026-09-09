@@ -2820,11 +2820,14 @@ This strategy enables transferring content and property overrides from a source 
     "Read Figma Motion animation data (Animation panel) for a node and its descendants: `animations` (keyframes per animatable field), `manualKeyframeTracks` and applied `animationStyles`, with exact durations, keyframe positions and easing. A node is reported only when it carries one of those three \u2014 `timelines` alone is NOT motion, because every node inherits the timeline of the frame it sits in. `nodesWithMotion: 0` with a non-zero `scanned` therefore means the subtree genuinely has no Motion, not that the scan missed it. This is NOT prototype data: Motion animations are invisible to `get_reactions`, and prototype transitions are invisible here \u2014 check both.",
     {
       nodeId: z.string().describe("Node ID to read Motion data from (its subtree is included)"),
-      maxDepth: z.number().int().min(0).optional().describe("How many levels below the node to include. Defaults to 6.")
+      maxDepth: z.number().int().min(0).optional().describe("How many levels below the node to include. Defaults to 6."),
+      includeAnimationStyleSchemas: z.boolean().optional().describe(
+        "Spell out Figma's six built-in animation presets with their full descriptions and prop schemas (~10KB). Off by default, which returns just their ids and names."
+      )
     },
-    async ({ nodeId, maxDepth }) => {
+    async ({ nodeId, maxDepth, includeAnimationStyleSchemas }) => {
       try {
-        const result = await sendCommandToFigma("get_motion", { nodeId, maxDepth });
+        const result = await sendCommandToFigma("get_motion", { nodeId, maxDepth, includeAnimationStyleSchemas });
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       } catch (error) {
         return {

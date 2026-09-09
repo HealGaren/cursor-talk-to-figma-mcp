@@ -379,7 +379,7 @@ async function handleCommand(command, params) {
       if (!params || !params.nodeId) {
         throw new Error("Missing nodeId parameter");
       }
-      return await getMotion(params.nodeId, params.maxDepth);
+      return await getMotion(params.nodeId, params.maxDepth, params.includeAnimationStyleSchemas);
     case "get_documentation":
       return await getDocumentation(params);
     case "set_default_connector":
@@ -2057,7 +2057,7 @@ async function getFrameContext(params) {
  * Beta API: every property access is guarded so an older Figma desktop build
  * just yields `supported: false` instead of throwing.
  */
-async function getMotion(nodeId, maxDepthParam) {
+async function getMotion(nodeId, maxDepthParam, includeAnimationStyleSchemas) {
   const root = await figma.getNodeByIdAsync(nodeId);
   if (!root) throw new Error(`Node not found: ${nodeId}`);
   const maxDepth = Number.isFinite(maxDepthParam) ? Math.max(0, Math.floor(maxDepthParam)) : 6;
@@ -2129,18 +2129,31 @@ async function getMotion(nodeId, maxDepthParam) {
   };
   walk(root, 0);
 
+  const rawStyles = safe(() => figma.motion && figma.motion.figmaAnimationStyles());
+  const animationStyleCatalog = Array.isArray(rawStyles)
+    ? (includeAnimationStyleSchemas
+        ? plain(rawStyles)
+        : rawStyles.map((style) => ({ styleId: safe(() => style.styleId), name: safe(() => style.name) })))
+    : plain(rawStyles);
+
   return {
     // `animations` missing entirely on the root means this Figma build predates Motion.
     supported: safe(() => root.animations) !== undefined,
     // The timeline the root sits on (id + duration in seconds). Inherited, so
     // it describes the containing frame, not the root itself.
     timeline: plain(safe(() => root.timelines)),
-    // figma.motion exposes exactly these: playheadPosition, figmaAnimationStyles
-    // and physicalSpringToNormalized. It has no `timelines` and no
+    // figma.motion exposes exactly these: playheadPosition (a getter, undefined
+    // outside an active motion-editing context), figmaAnimationStyles and
+    // physicalSpringToNormalized. It has no `timelines` and no
     // `animationStyles`, which is what this used to read — both were always
     // undefined, so the two fields they fed were always null.
     playheadPosition: plain(safe(() => figma.motion && figma.motion.playheadPosition)),
-    figmaAnimationStyles: plain(safe(() => figma.motion && figma.motion.figmaAnimationStyles)),
+    // figmaAnimationStyles is a FUNCTION, not a value, and returns Figma's six
+    // built-in motion presets. Each carries a paragraph of prose plus a full
+    // prop schema — roughly 10KB — so the catalogue is summarised by default
+    // and only spelled out when asked for. Reading it as a property (which is
+    // the mistake that hid it) yields a function object and then nothing.
+    figmaAnimationStyles: animationStyleCatalog,
     scanned: scanned,
     maxDepth: maxDepth,
     nodesWithMotion: results.length,

@@ -3014,10 +3014,13 @@ server.tool(
   {
     nodeId: z.string().describe("Node ID to read Motion data from (its subtree is included)"),
     maxDepth: z.number().int().min(0).optional().describe("How many levels below the node to include. Defaults to 6."),
+    includeAnimationStyleSchemas: z.boolean().optional().describe(
+      "Spell out Figma's six built-in animation presets with their full descriptions and prop schemas (~10KB). Off by default, which returns just their ids and names."
+    ),
   },
-  async ({ nodeId, maxDepth }: any) => {
+  async ({ nodeId, maxDepth, includeAnimationStyleSchemas }: any) => {
     try {
-      const result = await sendCommandToFigma("get_motion", { nodeId, maxDepth });
+      const result = await sendCommandToFigma("get_motion", { nodeId, maxDepth, includeAnimationStyleSchemas });
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (error) {
       return {
