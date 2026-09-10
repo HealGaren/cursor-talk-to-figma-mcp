@@ -135,6 +135,13 @@ type State = {
   speedPostedAt: number;
   shallowHistory: number[];
   deepHistory: Array<{ at: number; project: string; ok: boolean; ms: number }>;
+  // The last deep verdict for EACH project, which deepHistory cannot answer:
+  // it is a rolling window sized for the speed trend, so the oldest project's
+  // result falls out of it, and it does not carry the detail that says why a
+  // project failed. Without this the card could only ever show a verdict for
+  // the one project this turn happened to probe, and every other project read
+  // as "유휴" — including ones whose last probe had failed.
+  deepResults: Record<string, { at: number; ok: boolean; ms: number; detail: string }>;
 };
 
 function loadState(): State {
@@ -151,13 +158,14 @@ function loadState(): State {
       deepHistory: Array.isArray(loaded.deepHistory)
         ? loaded.deepHistory.filter((entry: { ok?: boolean; ms?: number }) => !entry?.ok || usableMs(entry?.ms))
         : [],
+      deepResults: loaded.deepResults && typeof loaded.deepResults === "object" ? loaded.deepResults : {},
     };
   } catch {
     return blankState();
   }
 }
 function blankState(): State {
-  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, incidentTs: null, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, downSince: {}, deepCursor: 0, deepPoolSize: 1, shallowHistory: [], deepHistory: [] };
+  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, incidentTs: null, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, downSince: {}, deepCursor: 0, deepPoolSize: 1, shallowHistory: [], deepHistory: [], deepResults: {} };
 }
 function saveState(state: State): void {
   try {
@@ -774,26 +782,80 @@ async function reportSpeed(state: State): Promise<void> {
 // plugin is single-threaded, so anything already running delays it — and a slow
 // probe on a busy project is not the same finding as a slow probe on an idle
 // one. Showing the load next to the timing is what separates them.
-function projectLines(health: Health, state?: State): string {
+// Per-project verdict, one icon each.
+//
+// An alert used to name the one thing that broke and list every project's LOAD
+// underneath, which is a different question: a project whose deep probe had
+// just failed still read "유휴" because it was connected and not busy. So one
+// broken project made the whole card look like a total outage, and a reader
+// had no way to see that the other six were fine.
+//
+// The verdict now combines both things the watcher knows about a project: that
+// it is connected (shallow, every 60s) and that it could actually answer
+// commands (deep, one project per turn). The deep half is per-project and
+// outlives the turn that produced it, so every line carries a real verdict
+// rather than the verdict of whichever project was probed last.
+type Verdict = { icon: string; label: string; broken: boolean };
+
+function verdictFor(title: string, health: Health, state?: State): Verdict {
   const byName = new Map(health.load.map((entry) => [nameKey(entry.name), entry]));
+  const entry = [...byName.entries()]
+    .find(([key]) => key.includes(nameKey(title)) || nameKey(title).includes(key))?.[1];
+
+  if (!entry) {
+    const downAt = state?.downSince?.[title];
+    return {
+      icon: ":red_circle:",
+      label: "플러그인 없음" + (downAt ? ` · ${clock(downAt)}부터 (${humanSince(downAt)})` : ""),
+      broken: true,
+    };
+  }
+
+  const busy = entry.running + entry.pending;
+  // Busy is not broken. A queue means someone is using the file, and saying so
+  // next to a green icon is the point — it explains a slow probe without
+  // implying a fault.
+  const load = busy
+    ? `처리 ${entry.running} · 대기 ${entry.pending} · 최장 ${secs(entry.oldestQueuedMs)}`
+    : "유휴";
+
+  const deep = state?.deepResults?.[nameKey(title)];
+  if (!deep) {
+    return { icon: ":white_circle:", label: `${load} · 심층 미확인`, broken: false };
+  }
+  const age = humanSince(deep.at);
+  if (!deep.ok) {
+    return { icon: ":red_circle:", label: `${load} · 심층 실패 (${age} 전) — ${deep.detail}`, broken: true };
+  }
+  return { icon: ":large_green_circle:", label: `${load} · 심층 정상 ${secs(deep.ms)} (${age} 전)`, broken: false };
+}
+
+function projectLines(health: Health, state?: State): string {
   return health.expected.map((title) => {
-    const entry = [...byName.entries()].find(([key]) => key.includes(nameKey(title)) || nameKey(title).includes(key))?.[1];
-    if (!entry) {
-      const downAt = state?.downSince?.[title];
-      return `   :red_circle: ${title} — 플러그인 없음`
-        + (downAt ? ` · ${clock(downAt)}부터 (${humanSince(downAt)})` : "");
-    }
-    const busy = entry.running + entry.pending;
-    const detail = busy
-      ? `처리 ${entry.running} · 대기 ${entry.pending} · 최장 ${secs(entry.oldestQueuedMs)}`
-      : "유휴";
-    return `   ${busy ? ":hourglass_flowing_sand:" : ":white_small_square:"} ${title} — ${detail}`;
+    const verdict = verdictFor(title, health, state);
+    const busyMark = /처리 [1-9]|대기 [1-9]/.test(verdict.label) ? " :hourglass_flowing_sand:" : "";
+    return `   ${verdict.icon} ${title}${busyMark} — ${verdict.label}`;
   }).join("\n");
+}
+
+// One glanceable row, so "is everything else fine?" is answered before any
+// reading happens. This is the line that stops one red project from reading as
+// a total outage.
+function projectStrip(health: Health, state?: State): string {
+  if (!health.expected.length) return "";
+  const verdicts = health.expected.map((title) => verdictFor(title, health, state));
+  const broken = verdicts.filter((verdict) => verdict.broken).length;
+  const strip = verdicts.map((verdict) => verdict.icon).join("");
+  const tally = broken
+    ? `${health.expected.length - broken}/${health.expected.length} 정상 · ${broken}개 이상`
+    : `${health.expected.length}/${health.expected.length} 정상`;
+  return `${strip}  ${tally}`;
 }
 
 function healthyText(state: State, health: Health): string {
   const deep = health.deep ? `\n• 심층 점검: ${displayName(health.deep.project)} — ${health.deep.detail}` : "";
   return `:large_green_circle: *Figma 헬스체크 · 이상 없음*\n`
+    + `${projectStrip(health, state)}\n`
     + `• 연결: ${coverage(health)}\n`
     + `• 마지막 확인: ${clock()} · 점검 ${state.checks}회 · 연속 정상 ${humanSince(state.since)}${deep}\n`
     // This watcher runs on the machine it watches, so it cannot report that
@@ -801,16 +863,19 @@ function healthyText(state: State, health: Health): string {
     // rewrite is due makes that silence legible instead of ambiguous: a card
     // whose promised time has passed is itself the alert.
     + `• 다음 갱신 예정: ${clock(Date.now() + HEALTHY_UPDATE_MS)} (이 시각이 지나도 그대로면 워처나 macmini-1 자체를 의심하세요)\n`
-    + `• 프로젝트별 부하:\n${projectLines(health, state)}\n`
+    + `• 프로젝트별 상태:\n${projectLines(health, state)}\n`
     + `:link: ${consoleLink}  ·  _워처 ${BUILD} · 기동 ${clock(STARTED_AT)}_`;
 }
 
 function degradedText(state: State, health: Health): string {
   const mention = ALERT_USER ? `<@${ALERT_USER}> ` : "";
   const lines = [`:red_circle: ${mention}*Figma 헬스체크 · 이상 감지*`];
+  // The blast radius goes above the cause. Whoever is being pulled in wants to
+  // know how much is broken before they read what broke.
+  if (health.relayUp && health.expected.length) lines.push(projectStrip(health, state));
   if (!health.relayUp) lines.push("• 릴레이에 접속할 수 없습니다 (macmini-1:3055)");
   if (health.missing.length) lines.push(`• 플러그인 없음: ${health.missing.map(displayName).join(", ")}`);
-  if (health.deep && !health.deep.ok) lines.push(`• 응답 없음: ${displayName(health.deep.project)} — ${health.deep.detail}`);
+  if (health.deep && !health.deep.ok) lines.push(`• 이번 심층 점검 실패: ${displayName(health.deep.project)} — ${health.deep.detail}`);
   lines.push(`• 최초 이상 감지: ${clock(state.since)} (${humanSince(state.since)} 경과) · 확인 ${state.checks}회`);
   // An alert that names only what broke leaves the reader asking whether the
   // rest is fine — which is the first thing anyone wants to know when they are
@@ -826,6 +891,7 @@ function degradedText(state: State, health: Health): string {
 
 function recoveredText(state: State, health: Health): string {
   return `:white_check_mark: *Figma 헬스체크 · 복구됨*\n`
+    + `${projectStrip(health, state)}\n`
     + `• ${humanSince(state.since)} 만에 정상 — 연결 ${coverage(health)}\n`
     + `• 확인: ${clock()}\n`
     + `:link: ${consoleLink}`;
@@ -1024,6 +1090,12 @@ async function runTick(): Promise<void> {
         });
       }
       if (state.deepHistory.length > SPEED_WINDOW * 3) state.deepHistory.splice(0, state.deepHistory.length - SPEED_WINDOW * 3);
+      state.deepResults[nameKey(damped.deep.project)] = {
+        at: Date.now(),
+        ok: !!damped.deep.ok,
+        ms: damped.deep.ms ?? 0,
+        detail: damped.deep.detail ?? "",
+      };
     }
   } else {
     damped.deep = last.deep;   // keep the last deep result visible on the card
@@ -1063,6 +1135,23 @@ Bun.serve({
     // Forces the deep probe now instead of waiting out the interval — for
     // verifying a deployment, and for checking a specific project by hand
     // after a repair without watching the clock.
+    // Render the cards without sending them anywhere.
+    //
+    // Card layout was previously only verifiable by posting to #dev_noti_figma
+    // and looking, which means every wording change costs the channel a
+    // message. This returns exactly what Slack would receive, from the live
+    // state, so a layout can be read before anyone else sees it.
+    if (url.pathname === "/preview") {
+      const health = last;
+      return new Response(JSON.stringify({
+        status: state.status,
+        strip: health ? projectStrip(health, state) : null,
+        healthy: health ? healthyText(state, health) : null,
+        degraded: health ? degradedText(state, health) : null,
+        recovered: health ? recoveredText(state, health) : null,
+        deepResults: state.deepResults,
+      }, null, 2), { headers: { "Content-Type": "application/json" } });
+    }
     if (url.pathname === "/check") {
       lastDeepAt = 0;
       return tick()
