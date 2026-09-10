@@ -413,11 +413,20 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
   //
   // But not every turn: always preferring the failure pins the rotation to it,
   // and the other six are never re-probed at all — they would go stale, which
-  // is a worse blindness than the slow recovery this fixes. Alternating gives
-  // the failure a check every other turn and keeps the rotation moving.
+  // is a worse blindness than the slow recovery this fixes.
+  //
+  // The bound is TIME SINCE that project was last probed, not a turn counter.
+  // Parity of deepCursor looked equivalent and was not: deepCheck probes twice
+  // and rewinds the cursor between the two, so the parity a probe sees is not
+  // the parity of the turn. Measured, that gave the failing project 8 of 12
+  // consecutive probes — very nearly the pinning this was written to avoid.
+  // Elapsed time cannot be knocked out of step by how many probes a turn runs.
   const failing = projects_.find((candidate: any) =>
     state.deepResults[nameKey(String(candidate.name))]?.ok === false);
-  const project = (failing && state.deepCursor % 2 === 0)
+  const failingLast = failing
+    ? state.deepResults[nameKey(String(failing.name))]?.at ?? 0
+    : 0;
+  const project = (failing && Date.now() - failingLast >= DEEP_MS)
     ? failing
     : projects_[state.deepCursor % projects_.length];
   state.deepPoolSize = projects_.length;
