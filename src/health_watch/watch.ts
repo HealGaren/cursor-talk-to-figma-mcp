@@ -795,7 +795,19 @@ async function reportSpeed(state: State): Promise<void> {
 // commands (deep, one project per turn). The deep half is per-project and
 // outlives the turn that produced it, so every line carries a real verdict
 // rather than the verdict of whichever project was probed last.
-type Verdict = { icon: string; label: string; broken: boolean };
+type Verdict = { icon: string; label: string; broken: boolean; busy: boolean };
+
+// How long a passing deep verdict is allowed to stand for.
+//
+// The rotation reaches each project about every DEEP_MS * projects, so a
+// verdict older than a few of those rounds means the probe is no longer
+// reaching that project at all — a drifting cursor, a rename that breaks the
+// nameKey match, or deep checks being skipped because the shallow check keeps
+// failing. Left unbounded, the last success stayed green forever: the card
+// would assert a project was fine on evidence days old and count it toward
+// "7/7 정상", which is precisely the claim this watcher exists to not make.
+const DEEP_STALE_AFTER_MS = Number(process.env.HEALTH_DEEP_STALE_MS || 0) ||
+  DEEP_MS * 7 * 3;
 
 function verdictFor(title: string, health: Health, state?: State): Verdict {
   const byName = new Map(health.load.map((entry) => [nameKey(entry.name), entry]));
@@ -808,6 +820,7 @@ function verdictFor(title: string, health: Health, state?: State): Verdict {
       icon: ":red_circle:",
       label: "플러그인 없음" + (downAt ? ` · ${clock(downAt)}부터 (${humanSince(downAt)})` : ""),
       broken: true,
+      busy: false,
     };
   }
 
@@ -821,19 +834,29 @@ function verdictFor(title: string, health: Health, state?: State): Verdict {
 
   const deep = state?.deepResults?.[nameKey(title)];
   if (!deep) {
-    return { icon: ":white_circle:", label: `${load} · 심층 미확인`, broken: false };
+    return { icon: ":white_circle:", label: `${load} · 심층 미확인`, broken: false, busy: busy > 0 };
   }
   const age = humanSince(deep.at);
+  // A failure is reported however old it is: nothing has come along to say it
+  // was fixed, and going quiet about it would be worse than showing its age.
   if (!deep.ok) {
-    return { icon: ":red_circle:", label: `${load} · 심층 실패 (${age} 전) — ${deep.detail}`, broken: true };
+    return { icon: ":red_circle:", label: `${load} · 심층 실패 (${age} 전) — ${deep.detail}`, broken: true, busy: busy > 0 };
   }
-  return { icon: ":large_green_circle:", label: `${load} · 심층 정상 ${secs(deep.ms)} (${age} 전)`, broken: false };
+  if (Date.now() - deep.at > DEEP_STALE_AFTER_MS) {
+    return {
+      icon: ":white_circle:",
+      label: `${load} · 심층 미확인 — 마지막 정상 확인이 ${age} 전 (점검이 이 프로젝트에 닿지 않는지 보세요)`,
+      broken: false,
+      busy: busy > 0,
+    };
+  }
+  return { icon: ":large_green_circle:", label: `${load} · 심층 정상 ${secs(deep.ms)} (${age} 전)`, broken: false, busy: busy > 0 };
 }
 
 function projectLines(health: Health, state?: State): string {
   return health.expected.map((title) => {
     const verdict = verdictFor(title, health, state);
-    const busyMark = /처리 [1-9]|대기 [1-9]/.test(verdict.label) ? " :hourglass_flowing_sand:" : "";
+    const busyMark = verdict.busy ? " :hourglass_flowing_sand:" : "";
     return `   ${verdict.icon} ${title}${busyMark} — ${verdict.label}`;
   }).join("\n");
 }
@@ -844,12 +867,16 @@ function projectLines(health: Health, state?: State): string {
 function projectStrip(health: Health, state?: State): string {
   if (!health.expected.length) return "";
   const verdicts = health.expected.map((title) => verdictFor(title, health, state));
+  const total = health.expected.length;
   const broken = verdicts.filter((verdict) => verdict.broken).length;
+  // Unconfirmed is counted apart from healthy. Folding it into the green total
+  // would have the strip claim a project is fine on evidence nobody gathered.
+  const unknown = verdicts.filter((verdict) => !verdict.broken && verdict.icon === ":white_circle:").length;
   const strip = verdicts.map((verdict) => verdict.icon).join("");
-  const tally = broken
-    ? `${health.expected.length - broken}/${health.expected.length} 정상 · ${broken}개 이상`
-    : `${health.expected.length}/${health.expected.length} 정상`;
-  return `${strip}  ${tally}`;
+  const parts = [`${total - broken - unknown}/${total} 정상`];
+  if (broken) parts.push(`${broken}개 이상`);
+  if (unknown) parts.push(`${unknown}개 미확인`);
+  return `${strip}  ${parts.join(" · ")}`;
 }
 
 function healthyText(state: State, health: Health): string {
@@ -1096,6 +1123,14 @@ async function runTick(): Promise<void> {
         ms: damped.deep.ms ?? 0,
         detail: damped.deep.detail ?? "",
       };
+      // deepHistory is trimmed just above; this needs the same care for a
+      // different reason. Keys are project names, so a rename or a project
+      // leaving defaultProjectIDs would otherwise leave its verdict — detail
+      // string and all — in the state file forever.
+      const expectedKeys = new Set(health.expected.map(nameKey));
+      for (const key of Object.keys(state.deepResults)) {
+        if (!expectedKeys.has(key)) delete state.deepResults[key];
+      }
     }
   } else {
     damped.deep = last.deep;   // keep the last deep result visible on the card
@@ -1132,9 +1167,6 @@ Bun.serve({
     if (url.pathname === "/health") {
       return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
     }
-    // Forces the deep probe now instead of waiting out the interval — for
-    // verifying a deployment, and for checking a specific project by hand
-    // after a repair without watching the clock.
     // Render the cards without sending them anywhere.
     //
     // Card layout was previously only verifiable by posting to #dev_noti_figma
@@ -1152,6 +1184,9 @@ Bun.serve({
         deepResults: state.deepResults,
       }, null, 2), { headers: { "Content-Type": "application/json" } });
     }
+    // Forces the deep probe now instead of waiting out the interval — for
+    // verifying a deployment, and for checking a specific project by hand
+    // after a repair without watching the clock.
     if (url.pathname === "/check") {
       lastDeepAt = 0;
       return tick()
