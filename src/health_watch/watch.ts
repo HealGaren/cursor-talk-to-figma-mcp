@@ -795,7 +795,7 @@ async function reportSpeed(state: State): Promise<void> {
 // commands (deep, one project per turn). The deep half is per-project and
 // outlives the turn that produced it, so every line carries a real verdict
 // rather than the verdict of whichever project was probed last.
-type Verdict = { icon: string; label: string; broken: boolean; busy: boolean };
+type Verdict = { icon: string; label: string; broken: boolean; busy: boolean; stale?: boolean };
 
 // How long a passing deep verdict is allowed to stand for.
 //
@@ -833,8 +833,15 @@ function verdictFor(title: string, health: Health, state?: State): Verdict {
     : "유휴";
 
   const deep = state?.deepResults?.[nameKey(title)];
+  // Waiting for a turn is not the same as being unknown.
+  //
+  // A white circle reads as "empty" — right after a restart the card was six
+  // white and one red, which looks like nothing is working. But the shallow
+  // check confirms every one of these is connected, every 60s; only the deep
+  // rotation has not reached them yet. Blue says "no problem found, its turn
+  // has not come", which is what is actually true.
   if (!deep) {
-    return { icon: ":white_circle:", label: `${load} · 심층 미확인`, broken: false, busy: busy > 0 };
+    return { icon: ":large_blue_circle:", label: `${load} · 심층 점검 대기`, broken: false, busy: busy > 0 };
   }
   const age = humanSince(deep.at);
   // A failure is reported however old it is: nothing has come along to say it
@@ -842,11 +849,15 @@ function verdictFor(title: string, health: Health, state?: State): Verdict {
   if (!deep.ok) {
     return { icon: ":red_circle:", label: `${load} · 심층 실패 (${age} 전) — ${deep.detail}`, broken: true, busy: busy > 0 };
   }
+  // Yellow, not blue: a verdict this old means the rotation is not reaching
+  // this project, which is a finding about the watcher rather than a project
+  // simply waiting its turn.
   if (Date.now() - deep.at > DEEP_STALE_AFTER_MS) {
     return {
-      icon: ":white_circle:",
-      label: `${load} · 심층 미확인 — 마지막 정상 확인이 ${age} 전 (점검이 이 프로젝트에 닿지 않는지 보세요)`,
+      icon: ":large_yellow_circle:",
+      label: `${load} · 심층 결과가 오래됨 — 마지막 정상 확인이 ${age} 전 (점검이 이 프로젝트에 닿지 않는지 보세요)`,
       broken: false,
+      stale: true,
       busy: busy > 0,
     };
   }
@@ -861,33 +872,36 @@ function projectLines(health: Health, state?: State): string {
   }).join("\n");
 }
 
-// One glanceable row, so "is everything else fine?" is answered before any
-// reading happens. This is the line that stops one red project from reading as
-// a total outage.
+// One line of counts, no icon row.
+//
+// This used to render the icons horizontally as well, which duplicated the
+// per-project list directly beneath it — the same seven icons twice, and the
+// horizontal row could not say WHICH project was which. The list does the
+// naming; this does the counting.
 function projectStrip(health: Health, state?: State): string {
   if (!health.expected.length) return "";
   const verdicts = health.expected.map((title) => verdictFor(title, health, state));
   const total = health.expected.length;
   const broken = verdicts.filter((verdict) => verdict.broken).length;
-  // Unconfirmed is counted apart from healthy. Folding it into the green total
-  // would have the strip claim a project is fine on evidence nobody gathered.
-  const unknown = verdicts.filter((verdict) => !verdict.broken && verdict.icon === ":white_circle:").length;
-  const strip = verdicts.map((verdict) => verdict.icon).join("");
-  const healthy = total - broken - unknown;
+  const stale = verdicts.filter((verdict) => verdict.stale).length;
+  // Waiting is counted apart from healthy: folding it in would have the line
+  // claim a project is fine on evidence nobody has gathered.
+  const waiting = verdicts.filter((verdict) => !verdict.broken && !verdict.stale
+    && verdict.icon === ":large_blue_circle:").length;
+  const healthy = total - broken - stale - waiting;
   // "0/7 정상" is technically true right after a restart and reads as "all
-  // seven are broken", which is the impression this strip exists to prevent.
-  // A fraction only makes sense when everything is accounted for; otherwise
-  // count the three states separately and say why 미확인 is expected to
-  // clear, since one full rotation is the answer and it is not obvious.
-  if (!broken && !unknown) return `${strip}  ${total}/${total} 정상`;
+  // seven are broken", which is the impression this line exists to prevent. A
+  // fraction only means anything when every project is accounted for.
+  if (!broken && !stale && !waiting) return `:large_green_circle: 전체 ${total}/${total} 정상`;
   const parts: string[] = [];
-  if (healthy) parts.push(`정상 ${healthy}`);
-  if (broken) parts.push(`이상 ${broken}`);
-  if (unknown) {
+  if (healthy) parts.push(`:large_green_circle: 정상 ${healthy}`);
+  if (broken) parts.push(`:red_circle: 이상 ${broken}`);
+  if (stale) parts.push(`:large_yellow_circle: 오래됨 ${stale}`);
+  if (waiting) {
     const rotation = Math.round((DEEP_MS * total) / 60_000);
-    parts.push(`미확인 ${unknown} (심층 순환 한 바퀴 ~${rotation}분)`);
+    parts.push(`:large_blue_circle: 심층 대기 ${waiting} (한 바퀴 ~${rotation}분)`);
   }
-  return `${strip}  ${parts.join(" · ")}`;
+  return parts.join("  ·  ");
 }
 
 function healthyText(state: State, health: Health): string {
