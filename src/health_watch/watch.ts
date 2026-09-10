@@ -873,9 +873,20 @@ function projectStrip(health: Health, state?: State): string {
   // would have the strip claim a project is fine on evidence nobody gathered.
   const unknown = verdicts.filter((verdict) => !verdict.broken && verdict.icon === ":white_circle:").length;
   const strip = verdicts.map((verdict) => verdict.icon).join("");
-  const parts = [`${total - broken - unknown}/${total} 정상`];
-  if (broken) parts.push(`${broken}개 이상`);
-  if (unknown) parts.push(`${unknown}개 미확인`);
+  const healthy = total - broken - unknown;
+  // "0/7 정상" is technically true right after a restart and reads as "all
+  // seven are broken", which is the impression this strip exists to prevent.
+  // A fraction only makes sense when everything is accounted for; otherwise
+  // count the three states separately and say why 미확인 is expected to
+  // clear, since one full rotation is the answer and it is not obvious.
+  if (!broken && !unknown) return `${strip}  ${total}/${total} 정상`;
+  const parts: string[] = [];
+  if (healthy) parts.push(`정상 ${healthy}`);
+  if (broken) parts.push(`이상 ${broken}`);
+  if (unknown) {
+    const rotation = Math.round((DEEP_MS * total) / 60_000);
+    parts.push(`미확인 ${unknown} (심층 순환 한 바퀴 ~${rotation}분)`);
+  }
   return `${strip}  ${parts.join(" · ")}`;
 }
 
