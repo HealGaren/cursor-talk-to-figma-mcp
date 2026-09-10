@@ -97,6 +97,9 @@ const PROJECTS_JSON = process.env.HEALTH_PROJECTS_JSON
   || `${homedir()}/.codex/skills/figma-product-mcp/scripts/projects.json`;
 
 type Health = {
+  // Projects whose last deep verdict was a failure, regardless of which one
+  // this tick probed. Drives the headline so it cannot disagree with the list.
+  failingDeep?: string[];
   ok: boolean;
   relayUp: boolean;
   expected: string[];
@@ -401,7 +404,22 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
   const pool = managed.length ? managed : [];
   if (!pool.length) return null;
   const projects_ = pool;
-  const project = projects_[state.deepCursor % projects_.length];
+  // A failing project gets re-probed on alternate turns.
+  //
+  // The cursor rotates blindly, so a failure had to wait for six healthy
+  // projects before anything could clear it — a project stayed reported broken
+  // for up to a full rotation after it had already recovered. Failures are what
+  // the rotation exists to find, so they deserve to be looked at sooner.
+  //
+  // But not every turn: always preferring the failure pins the rotation to it,
+  // and the other six are never re-probed at all — they would go stale, which
+  // is a worse blindness than the slow recovery this fixes. Alternating gives
+  // the failure a check every other turn and keeps the rotation moving.
+  const failing = projects_.find((candidate: any) =>
+    state.deepResults[nameKey(String(candidate.name))]?.ok === false);
+  const project = (failing && state.deepCursor % 2 === 0)
+    ? failing
+    : projects_[state.deepCursor % projects_.length];
   state.deepPoolSize = projects_.length;
   state.deepCursor = (state.deepCursor + 1) % Math.max(1, projects_.length);
   const name = String(project.name);
@@ -927,7 +945,11 @@ function degradedText(state: State, health: Health): string {
   if (health.relayUp && health.expected.length) lines.push(projectStrip(health, state));
   if (!health.relayUp) lines.push("• 릴레이에 접속할 수 없습니다 (macmini-1:3055)");
   if (health.missing.length) lines.push(`• 플러그인 없음: ${health.missing.map(displayName).join(", ")}`);
-  if (health.deep && !health.deep.ok) lines.push(`• 이번 심층 점검 실패: ${displayName(health.deep.project)} — ${health.deep.detail}`);
+  if (health.failingDeep?.length) {
+    lines.push(`• 심층 점검 실패: ${health.failingDeep.map(displayName).join(", ")} (자세한 내용은 아래 프로젝트별 상태)`);
+  } else if (health.deep && !health.deep.ok) {
+    lines.push(`• 이번 심층 점검 실패: ${displayName(health.deep.project)} — ${health.deep.detail}`);
+  }
   lines.push(`• 최초 이상 감지: ${clock(state.since)} (${humanSince(state.since)} 경과) · 확인 ${state.checks}회`);
   // An alert that names only what broke leaves the reader asking whether the
   // rest is fine — which is the first thing anyone wants to know when they are
@@ -1167,6 +1189,19 @@ async function runTick(): Promise<void> {
   // replaces it — and after a failure we retry sooner so a real recovery is not
   // hidden behind the full interval.
   if (damped.deep && !damped.deep.ok) damped.ok = false;
+
+  // And it has to outlive the PROJECT that produced it, not just the tick.
+  //
+  // damped.deep is whichever single project this turn happened to probe, so
+  // once the rotation moved on, an earlier failure stopped counting: the card
+  // said "이상 없음" in its headline while listing a red GW_Product three lines
+  // below and tallying "1개 이상". Nobody can act on a card that contradicts
+  // itself. Any project whose last deep verdict is a failure keeps the whole
+  // check degraded until a later probe of THAT project replaces it.
+  const failingDeep = health.expected.filter(
+    (title) => state.deepResults[nameKey(title)]?.ok === false);
+  if (failingDeep.length) damped.ok = false;
+  damped.failingDeep = failingDeep;
 
   last = damped;
   await report(state, damped);
